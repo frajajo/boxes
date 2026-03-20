@@ -1,0 +1,89 @@
+{
+  "name": "boxes",
+  "version": "3.2.1",
+  "description": "Application de gestion de box multiples",
+  "main": "main.js",
+  "author": {
+    "name": "François Falik",
+    "email": "francois.falik@gmail.com"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis --x64",
+    "dist:portable": "electron-builder --win portable --x64"
+  },
+  "dependencies": {
+    "canvas": "^3.2.1",
+    "pdfjs-dist": "^2.16.105",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.3",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "build": {
+    "appId": "com.francoisfalik.boxes",
+    "productName": "Boxes",
+    "copyright": "Copyright © 2025 François Falik",
+    "npmRebuild": false,
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer.js",
+      "manager-renderer.js",
+      "dialog-utils.js",
+      "fence.html",
+      "manager.html",
+      "style.css",
+      "manager-style.css",
+      "assets/icon.ico",
+      "assets/icons/**",
+      "node_modules/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "signAndEditExecutable": false,
+      "forceCodeSigning": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Boxes -${version}.exe",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "Boxes-Setup-${version}.exe",
+      "include": "installer.nsh"
+    },
+    "portable": {
+      "artifactName": "Boxes-portable-${version}.exe"
+    },
+    "directories": {
+      "output": "E:\\fences-lite\\dist",
+      "buildResources": "assets"
+    },
+    "extraResources": [
+      {
+        "from": "assets/icon.ico",
+        "to": "assets/icon.ico"
+      }
+    ],
+    "afterPack": "./afterPack.js",
+    "asar": false
+  }
+}

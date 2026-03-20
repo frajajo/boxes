@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="fr">
+
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fence Manager</title>
+
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'">
+
+  <link rel="stylesheet" href="manager-style.css" />
+</head>
+
+<body>
+  <div id="titlebar">
+    <div class="title">My Boxes</div>
+    <div class="win-controls">
+      <button class="wc-btn" id="wc-autostart" title="Démarrage automatique avec Windows">⏵</button>
+      <button class="wc-btn" id="wc-help" title="Aide">&#x3F;</button>
+      <button class="wc-btn" id="wc-min" title="Minimiser">&#x2013;</button>
+      <button class="wc-btn" id="wc-max" title="Agrandir">&#x25A1;</button>
+      <button class="wc-btn" id="wc-close" title="Masquer dans le tray">&#x2715;</button>
+      <button class="wc-btn wc-quit" id="wc-quit" title="Quitter Boxes complètement">&#x23FB;</button>
+    </div>
+  </div>
+
+  <!-- Modale d'aide -->
+  <div id="help-overlay" style="display:none">
+    <div id="help-modal">
+      <div id="help-header">
+        <div id="help-logo">🪟</div>
+        <div>
+          <div id="help-title">My Boxes</div>
+          <div id="help-subtitle">par François Falik</div>
+        </div>
+        <button id="help-close">&#x2715;</button>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">🚀 Gestion des boxes</div>
+        <div class="help-item">
+          <span class="help-key">+</span>
+          <span>Cliquez sur <b>Nouvelle Box</b> pour créer un groupe</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">clic</span>
+          <span>Cliquez sur une box dans cette liste pour l'ouvrir ou la mettre au premier plan</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">✏️</span>
+          <span>Cliquez sur le titre d'une box pour la renommer directement</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">⧉</span>
+          <span><b>Dupliquer</b> une box — copie la box et tous ses fichiers avec le suffixe "(copie)"</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">🗑️</span>
+          <span>Supprimez une box depuis cette fenêtre — les fichiers sont envoyés à la corbeille</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">⊞</span>
+          <span>Bouton taille dans cette liste : choisissez la taille des icônes par box (32 / 48 / 128 px)</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">📁 Gestion des fichiers</div>
+        <div class="help-item">
+          <span class="help-key">Drag</span>
+          <span>Glissez-déposez des fichiers ou dossiers depuis l'explorateur Windows dans une box — ils sont copiés automatiquement</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">Drag</span>
+          <span>Déplacez un fichier d'une box à une autre par glisser-déposer inter-boxes. Si plusieurs fichiers sont sélectionnés (Ctrl+clic ou rectangle), ils se déplacent tous en même temps</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">Drag</span>
+          <span>Glissez un fichier depuis une box vers le bureau ou l'explorateur Windows pour le déplacer hors de la box</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">⇄</span>
+          <span><b>Ordre manuel</b> — en mode tri "Ordre original", glissez une icône sur une autre pour la réorganiser. L'ordre est sauvegardé automatiquement</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">2×clic</span>
+          <span>Double-cliquez sur un fichier pour l'ouvrir avec son application par défaut</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">Suppr</span>
+          <span>Touche <b>Suppr</b> : envoie le(s) fichier(s) sélectionné(s) à la corbeille</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">Ctrl+A</span>
+          <span>Sélectionner tous les fichiers de la box</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">⬚</span>
+          <span>Cliquez-glissez sur le fond de la box pour sélectionner plusieurs fichiers à la fois (rectangle de sélection)</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">🖱️ Menu contextuel (clic droit)</div>
+        <div class="help-item">
+          <span class="help-key">Ouvrir</span>
+          <span>Ouvre le fichier avec son application par défaut</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">📂</span>
+          <span><b>Ouvrir le dossier</b> — révèle le fichier dans l'explorateur Windows</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">📋</span>
+          <span><b>Copier sur le bureau</b> — copie le fichier sans le retirer de la box</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">↗</span>
+          <span><b>Déplacer sur le bureau</b> — extrait le fichier de la box vers le bureau</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">✏️</span>
+          <span><b>Renommer</b> — modifie le nom du fichier directement dans la box</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">🖼️</span>
+          <span><b>Changer l'icône…</b> — assignez une image personnalisée (PNG, JPG, ICO) à un fichier dont l'icône est générique ou manquante</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">↺</span>
+          <span><b>Réinitialiser l'icône</b> — restaure l'icône système d'origine</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">🗑️</span>
+          <span><b>Supprimer</b> — envoie le fichier à la corbeille</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">🎨 Personnalisation des boxes</div>
+        <div class="help-item">
+          <span class="help-key">🎨</span>
+          <span>Bouton palette dans chaque box : choisissez la couleur de fond (presets ou couleur libre) et l'opacité</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">2×clic</span>
+          <span><b>Rouler / dérouler</b> — double-cliquez sur la zone vide de la barre de titre pour réduire la box à sa barre de titre. Double-cliquez à nouveau pour la rouvrir à sa taille d'origine. L'état est sauvegardé automatiquement</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">⇅</span>
+          <span>Bouton tri : classez les fichiers par Nom, Type, Date de modification ou ordre d'ajout original — cliquez deux fois sur le même critère pour inverser l'ordre</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">ext.</span>
+          <span><b>Afficher les extensions</b> — toggle dans le panneau 🎨 : affiche ou masque les extensions de fichiers (.pdf, .docx…) sous chaque icône. Les fichiers système (.lnk, .exe, .url…) sont toujours affichés sans extension</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">↔↕</span>
+          <span>Redimensionnez une box en tirant le coin bas-droit</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">drag</span>
+          <span>Déplacez une box en faisant glisser sa barre de titre</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">🗂️ Ranger le bureau automatiquement</div>
+        <div class="help-item">
+          <span class="help-key">🎨</span>
+          <span>Option <b>Ranger le bureau</b> dans le panneau 🎨 de chaque box (activée par défaut)</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">auto</span>
+          <span>Quand vous glissez un fichier <b>depuis le bureau</b> dans une box, l'original est automatiquement déplacé dans un sous-dossier du bureau portant le nom de la box</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">ex.</span>
+          <span>Un fichier glissé dans la box <i>Projets</i> déplace l'original dans <code>Bureau\Projets\</code> — le bureau reste propre</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">off</span>
+          <span>Désactivez l'option si vous préférez que l'original reste à sa place sur le bureau</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">🖼️ Aperçus & icônes</div>
+        <div class="help-item">
+          <span class="help-key">PDF</span>
+          <span>Miniature de la première page générée automatiquement</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">PSD</span>
+          <span>Aperçu extrait du fichier Photoshop sans ouvrir l'application</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">.lnk</span>
+          <span>Raccourcis Windows : icône résolue depuis la cible (Office, Adobe, etc.)</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">.url</span>
+          <span>Favoris web : icône colorée générée depuis le nom de domaine</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">img</span>
+          <span>Images (JPG, PNG, GIF, WebP…) : miniature native affichée directement</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">vidéo</span>
+          <span>Vidéos et fichiers Adobe (Premiere, After Effects, InDesign…) : aperçu Shell Windows</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">⌨️ Raccourci clavier global</div>
+        <div class="help-item">
+          <span class="help-key">Alt+Espace</span>
+          <span><b>Afficher / masquer toutes les boxes</b> — fonctionne depuis n'importe quelle application, même quand Boxes est en arrière-plan. Appuyez une fois pour masquer toutes les boxes, appuyez à nouveau pour les faire réapparaître</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">🔔 Icône dans la barre des tâches (tray)</div>
+        <div class="help-item">
+          <span class="help-key">clic</span>
+          <span>Clic gauche sur l'icône Boxes dans la zone de notification — affiche ou masque le gestionnaire</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">clic ⊞</span>
+          <span>Clic droit — ouvre un menu avec accès direct à chaque box, "Tout afficher", "Tout masquer" et "Quitter"</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">✕</span>
+          <span>Le bouton <b>✕</b> du gestionnaire masque la fenêtre dans le tray — l'app continue de tourner</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">⏻</span>
+          <span>Le bouton <b>⏻</b> du gestionnaire quitte complètement Boxes</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">💾 Icônes personnalisées (export / import)</div>
+        <div class="help-item">
+          <span class="help-key">⬆</span>
+          <span><b>Exporter icônes</b> — crée un dossier <code>Boxes-icons-[date]</code> sur le bureau avec toutes vos icônes personnalisées</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">⬇</span>
+          <span><b>Importer icônes</b> — restaure des icônes depuis un dossier exporté précédemment (après une réinstallation ou sur un autre PC)</span>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">💾 Stockage & démarrage</div>
+        <div class="help-item">
+          <span class="help-key">📂</span>
+          <span>Les fichiers sont copiés dans <code>C:\Users\[vous]\AppData\Roaming\Boxes\fences\</code></span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">🖼️</span>
+          <span>Les icônes personnalisées sont stockées dans <code>C:\Users\[vous]\AppData\Roaming\Boxes\custom-icons\</code></span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">↺</span>
+          <span>Positions, tailles et styles de chaque box sauvegardés automatiquement</span>
+        </div>
+        <div class="help-item">
+          <span class="help-key">⏵</span>
+          <span>Bouton démarrage automatique (vert = actif) — Boxes se lance avec Windows</span>
+        </div>
+      </div>
+
+      <div id="help-footer">
+        <span id="help-version">Boxes</span>
+        <span>© 2025 François Falik</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="container">
+    <div class="manager-actions-row">
+      <button id="export-btn" class="secondary-btn" title="Exporter les icônes personnalisées">⬆ Exporter
+        icônes</button>
+      <button id="import-btn" class="secondary-btn" title="Importer les icônes personnalisées">⬇ Importer
+        icônes</button>
+    </div>
+
+    <button id="create-btn" class="create-btn">
+      <span class="plus-icon">+</span>
+      Nouvelle Box
+    </button>
+
+    <div id="fence-list"></div>
+  </div>
+
+  <script src="manager-renderer.js"></script>
+</body>
+
+</html>
