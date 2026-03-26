@@ -1,0 +1,605 @@
+:root {
+  --bg: rgba(30, 30, 30, 0.6);
+  --bg-hover: rgba(40, 40, 40, 0.7);
+  --border: rgba(255, 255, 255, 0.25);
+  --text: #f0f0f0;
+  --accent: #66aaff;
+  --icon-size: 48px;
+}
+
+/* Global */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
+  user-select: none;
+  overflow: hidden;
+  /* ← LA LIGNE QUI RÉSOUT TON BUG */
+}
+
+/* ─────────────────────────────────────────────── */
+/* Zone titre (draggable + titre éditable)         */
+/* ─────────────────────────────────────────────── */
+
+#titlebar {
+  -webkit-app-region: drag;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  /* backdrop-filter: blur(6px); */
+}
+
+#titlebar .title {
+  -webkit-app-region: no-drag;
+  /* ← indispensable */
+  cursor: text;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+#titlebar .title:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+#titlebar .title .title-edit {
+  all: unset;
+  padding: 2px 4px;
+  min-width: 140px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 4px;
+  outline: none;
+  color: #fff;
+  font-size: 12px;
+}
+
+#titlebar .actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* Zone centrale cliquable pour le rollup (double-clic) */
+#titlebar .titlebar-rollup-zone {
+  flex: 1;
+  height: 100%;
+  -webkit-app-region: drag;  /* ← doit être drag pour que la fenêtre soit déplaçable */
+  cursor: pointer;
+}
+
+/* ─────────────────────────────────────────────── */
+/* Zone principale (contenu fichiers)              */
+/* ─────────────────────────────────────────────── */
+
+#container {
+  -webkit-app-region: no-drag;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, calc(var(--icon-size) + 16px));
+  gap: 12px;
+  padding: 12px;
+  padding-bottom: 40px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  transition: background 120ms ease;
+  min-width: 360px;
+  min-height: 100px;
+  position: relative;
+  max-width: 100%;
+  /* Scroll quand les icônes dépassent la hauteur de la fenêtre */
+  overflow-x: hidden;
+  overflow-y: auto;
+  /* Hauteur max = fenêtre - titlebar */
+  max-height: calc(100vh - 28px);
+  box-sizing: border-box;
+}
+
+#container.drop-hint {
+  background: var(--bg-hover);
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+
+/* Scrollbar container */
+#container::-webkit-scrollbar { width: 6px; }
+#container::-webkit-scrollbar-track { background: rgba(0,0,0,0.15); border-radius: 3px; }
+#container::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.18); border-radius: 3px; }
+#container::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.3); }
+
+/* Icônes internes */
+
+.icon {
+  width: calc(var(--icon-size) + 16px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 6px;
+  position: relative; /* requis pour ::before/::after insert-before/insert-after */
+}
+
+.icon img {
+  width: var(--icon-size);
+  height: var(--icon-size);
+  object-fit: contain;
+  margin-bottom: 6px;
+}
+
+.icon .name {
+  font-size: 11px;
+  line-height: 1.25;
+  text-align: center;
+  max-width: 100%;
+  color: #e6e6e6;
+
+  /* Limite à 2 lignes — les noms trop longs affichent "…" */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+/* ─────────────────────────────────────────────── */
+/* Tooltip nom complet au survol                   */
+/* ─────────────────────────────────────────────── */
+
+#icon-tooltip {
+  position: fixed;
+  z-index: 99999;
+  pointer-events: none;
+  background: rgba(20, 20, 20, 0.93);
+  color: #f0f0f0;
+  font-size: 11px;
+  font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
+  line-height: 1.4;
+  padding: 4px 9px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  white-space: nowrap;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  max-width: calc(100vw - 20px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─────────────────────────────────────────────── */
+/* Menu contextuel                                */
+/* ─────────────────────────────────────────────── */
+
+.ctx {
+  position: fixed;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  background: rgba(25, 25, 25, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.ctx>button {
+  all: unset;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #eee;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ctx>button:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ctx>button[data-act="extract-copy"],
+.ctx>button[data-act="extract-move"] {
+  color: #88ccff;
+}
+
+.ctx>button[data-act="extract-copy"] {
+  border-top: 1px solid rgba(255,255,255,0.1);
+  margin-top: 2px;
+  padding-top: 10px;
+}
+
+.ctx>button[data-act="rename"] {
+  border-top: 1px solid rgba(255,255,255,0.1);
+  margin-top: 2px;
+  padding-top: 10px;
+}
+
+.ctx>button[data-act="change-icon"] {
+  border-top: 1px solid rgba(255,255,255,0.1);
+  margin-top: 2px;
+  padding-top: 10px;
+  color: #aaddff;
+}
+
+.ctx>button[data-act="reset-icon"] {
+  color: rgba(255,255,255,0.45);
+  font-size: 11px;
+}
+
+.ctx>button[data-act="delete"] {
+  border-top: 1px solid rgba(255,255,255,0.1);
+  margin-top: 2px;
+  padding-top: 10px;
+  color: #ff8888;
+}
+
+/* ─────────────────────────────────────────────── */
+/* Poignées de redimensionnement                  */
+/* ─────────────────────────────────────────────── */
+
+/* Poignée bas verticale — désactivée (non fonctionnelle sous Windows transparent+frameless) */
+#resize-bottom {
+  display: none;
+}
+
+/* Poignée coin bas-droite */
+#resize-br {
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  width: 20px;
+  height: 20px;
+  cursor: nwse-resize;
+  -webkit-app-region: no-drag;
+  background: transparent;
+  z-index: 100000;
+  pointer-events: auto;
+}
+/* ─────────────────────────────────────────────── */
+/* Bouton et menu de tri                           */
+/* ─────────────────────────────────────────────── */
+
+.sort-btn {
+  all: unset;
+  -webkit-app-region: no-drag;
+  cursor: pointer;
+  font-size: 14px;
+  color: rgba(255,255,255,0.6);
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: background 120ms, color 120ms;
+  line-height: 1;
+}
+
+.sort-btn:hover {
+  background: rgba(255,255,255,0.1);
+  color: #fff;
+}
+
+.sort-menu {
+  position: fixed;
+  z-index: 99999;
+  display: flex;
+  flex-direction: column;
+  background: rgba(25, 25, 25, 0.97);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  overflow: hidden;
+  min-width: 140px;
+}
+
+.sort-menu button {
+  all: unset;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: #eee;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.sort-menu button:hover {
+  background: rgba(255,255,255,0.08);
+}
+
+.sort-menu button.active {
+  color: var(--accent);
+}
+
+/* Fix alignement menu tri */
+.sort-menu {
+  left: auto !important;
+}
+
+/* ─────────────────────────────────────────────── */
+/* Panel d'apparence (couleur + opacité)           */
+/* ─────────────────────────────────────────────── */
+
+.style-panel {
+  position: fixed;
+  z-index: 99999;
+  background: rgba(20, 20, 20, 0.97);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+  padding: 12px 14px;
+  min-width: 220px;
+  backdrop-filter: blur(10px);
+}
+
+.style-panel-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(255,255,255,0.4);
+  margin-bottom: 10px;
+}
+
+.style-row {
+  margin-bottom: 10px;
+}
+
+.style-row label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: rgba(255,255,255,0.7);
+  margin-bottom: 6px;
+}
+
+.opacity-val {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.color-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.color-swatch {
+  all: unset;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: transform 120ms, border-color 120ms;
+  flex-shrink: 0;
+}
+
+.color-swatch:hover {
+  transform: scale(1.15);
+  border-color: rgba(255,255,255,0.4);
+}
+
+.color-swatch.active {
+  border-color: var(--accent);
+  transform: scale(1.15);
+}
+
+.color-custom {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: 2px solid rgba(255,255,255,0.2);
+  padding: 0;
+  cursor: pointer;
+  background: none;
+  flex-shrink: 0;
+}
+
+.color-custom::-webkit-color-swatch-wrapper { padding: 0; border-radius: 4px; }
+.color-custom::-webkit-color-swatch        { border: none; border-radius: 4px; }
+
+.opacity-slider {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* ─────────────────────────────────────────────── */
+/* Drag & drop inter-fences                        */
+/* ─────────────────────────────────────────────── */
+
+/* Icône en cours de drag : semi-transparente */
+.icon.dragging {
+  opacity: 0.35;
+  cursor: grabbing;
+}
+
+/* Curseur grab sur les icônes */
+.icon {
+  cursor: default;
+}
+.icon:active {
+  cursor: grabbing;
+}
+
+/* Fence cible qui reçoit un drag inter-fences */
+#container.drop-inter {
+  background: rgba(102, 170, 255, 0.18);
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+/* --- Modern Glass (≈20 lignes) --- */
+#container{
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  border: 1px solid rgba(255,255,255,.10);
+  box-shadow: 0 18px 40px rgba(0,0,0,.35);
+}
+#titlebar{
+  backdrop-filter: blur(10px) saturate(140%);
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+  border-bottom: 1px solid rgba(255,255,255,.08);
+}
+.icon{
+  border-radius: 14px;
+  transition: transform .12s ease, background .12s ease, box-shadow .12s ease;
+}
+.icon:hover{
+  background: rgba(255,255,255,.08);
+  box-shadow: 0 10px 22px rgba(0,0,0,.22);
+  transform: translateY(-2px);
+}
+.icon:active{ transform: translateY(0px) scale(.98); }
+.icon img{ filter: drop-shadow(0 6px 8px rgba(0,0,0,.35)); }
+.name{ text-shadow: 0 2px 8px rgba(0,0,0,.55); }
+.selection-box {
+  position: absolute;
+  z-index: 50;
+  pointer-events: none;
+  border: 1px solid rgba(0,120,215,0.9);
+  background: rgba(0,120,215,0.18);
+  border-radius: 6px;
+}
+
+/* ─────────────────────────────────────────────── */
+/* Placeholder box vide                            */
+/* ─────────────────────────────────────────────── */
+
+.empty-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.25);
+  pointer-events: none;
+  user-select: none;
+  letter-spacing: 0.03em;
+}
+
+/* ─────────────────────────────────────────────── */
+/* Cible de drop pour réorganisation interne       */
+/* ─────────────────────────────────────────────── */
+
+.icon.drop-target { /* inutilisé désormais */ }
+
+/* Ligne d'insertion avant l'icône */
+.icon.insert-before::before {
+  content: '';
+  position: absolute;
+  left: 0px;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  background: rgba(102, 170, 255, 0.95);
+  border-radius: 2px;
+  box-shadow: 0 0 8px rgba(102, 170, 255, 0.8);
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* Ligne d'insertion après l'icône */
+.icon.insert-after::after {
+  content: '';
+  position: absolute;
+  right: 0px;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  background: rgba(102, 170, 255, 0.95);
+  border-radius: 2px;
+  box-shadow: 0 0 8px rgba(102, 170, 255, 0.8);
+  pointer-events: none;
+  z-index: 10;
+}
+
+
+/* ─────────────────────────────────────────────── */
+/* Hover / sélection style Windows 11             */
+/* ─────────────────────────────────────────────── */
+
+.icon {
+  border-radius: 12px;
+  transition:
+    transform 120ms ease,
+    background 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.icon:hover {
+  background: rgba(255,255,255,0.08);
+  box-shadow:
+    0 8px 18px rgba(0,0,0,0.25),
+    inset 0 0 0 1px rgba(255,255,255,0.08);
+  transform: translateY(-2px);
+}
+
+.icon img {
+  transition: transform 120ms ease;
+}
+
+.icon:hover img {
+  transform: scale(1.08);
+}
+
+.icon.selected {
+  background: rgba(0,120,215,0.25);
+  box-shadow: inset 0 0 0 1px rgba(0,120,215,0.8);
+}
+
+.name {
+  text-shadow:
+    0 2px 6px rgba(0,0,0,0.6),
+    0 0 2px rgba(0,0,0,0.5);
+}
+
+/* ─────────────────────────────────────────────── */
+/* Toggle switch (afficher extensions)             */
+/* ─────────────────────────────────────────────── */
+.ext-toggle-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.ext-toggle-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.ext-toggle-track {
+  width: 32px;
+  height: 18px;
+  background: rgba(255,255,255,0.15);
+  border-radius: 9px;
+  border: 1px solid rgba(255,255,255,0.2);
+  transition: background 150ms ease;
+  display: flex;
+  align-items: center;
+  padding: 0 2px;
+  box-sizing: border-box;
+}
+.ext-toggle-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.5);
+  transition: transform 150ms ease, background 150ms ease;
+  flex-shrink: 0;
+}
+.ext-toggle-input:checked + .ext-toggle-track {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.ext-toggle-input:checked + .ext-toggle-track .ext-toggle-thumb {
+  transform: translateX(14px);
+  background: #fff;
+}

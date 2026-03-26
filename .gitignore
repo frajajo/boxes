@@ -1,0 +1,7 @@
+node_modules/
+dist/
+out/
+.env
+*.log
+icon-cache/
+doc-icons-v1/
