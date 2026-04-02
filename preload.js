@@ -117,6 +117,12 @@ const api = {
 
   // Rollup — réduire une box à sa barre de titre
   toggleRollup: (fenceId) => ipcRenderer.invoke('fence-toggle-rollup', fenceId),
+
+  // Verrouillage de position
+  setFenceLocked: (fenceId, locked) => ipcRenderer.invoke('fence-set-locked', fenceId, locked),
+  onLockedStateChanged: (cb) => ipcRenderer.on('locked-state-changed', (_evt, locked) => cb(locked)),
+  moveWindow: (dx, dy) => ipcRenderer.send('move-window', dx, dy),
+  setContentHeight: (height) => ipcRenderer.send('set-content-height', height),
   onRolledStateChanged: (cb) => ipcRenderer.on('rolled-state-changed', (_evt, isRolled) => cb(isRolled)),
 
   // Version de l'application

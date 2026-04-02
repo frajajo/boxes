@@ -18,6 +18,7 @@ const crypto = require("crypto");
 function debugLog() {}
 
 const { pathToFileURL } = require("url");
+const { autoUpdater } = require('electron-updater');
 
 // ─────────────────────────────────────────────
 // Cache disque des icônes (PNG) — rapide + persistant
@@ -462,6 +463,7 @@ async function getPdfThumbnail(filePath) {
 const FENCES_BASE_DIR = path.join(app.getPath("userData"), "fences");
 const CONFIG_PATH = path.join(app.getPath("userData"), "config.json");
 const TITLE_HEIGHT = 32; // hauteur de la barre de titre (28px + bordures)
+const FENCE_MIN_W = 160;  // largeur minimale d'une fence
 
 // États
 const openFences = new Map();
@@ -594,11 +596,12 @@ function createFence(fenceId, fenceName) {
     height: isRolledOnStart ? TITLE_HEIGHT : (fenceConfig.bounds?.height ?? 360),
     x: fenceConfig.bounds?.x,
     y: fenceConfig.bounds?.y,
-    minWidth: 420,
-    minHeight: isRolledOnStart ? TITLE_HEIGHT : 300,
+    minWidth: FENCE_MIN_W,
+    minHeight: isRolledOnStart ? TITLE_HEIGHT : 80,
     transparent: true,
     frame: false,
     resizable: true,
+    maximizable: false,
     skipTaskbar: false,
     backgroundColor: "#00000000",
     title: fenceConfig.name,
@@ -634,8 +637,29 @@ function createFence(fenceId, fenceName) {
     }, 300);
   };
 
-  win.on("move", queueSave);
-  win.on("resize", queueSave);
+  // Position de référence quand la fence est verrouillée
+  let lockedBounds = null;
+
+  win.on("move", () => {
+    if (lockedBounds) {
+      // Remettre immédiatement à la position verrouillée
+      win.setBounds(lockedBounds);
+      return;
+    }
+    queueSave();
+  });
+
+  win.on("resize", () => {
+    if (lockedBounds) {
+      win.setBounds(lockedBounds);
+      return;
+    }
+    queueSave();
+  });
+
+  // Exposer lockedBounds pour le handler IPC fence-set-locked
+  win._lockedBounds = () => lockedBounds;
+  win._setLockedBounds = (b) => { lockedBounds = b; };
 
   win.on("close", () => {
     try {
@@ -659,6 +683,10 @@ function createFence(fenceId, fenceName) {
   win.webContents.once('did-finish-load', () => {
     if (isRolledOnStart) {
       win.webContents.send('rolled-state-changed', true);
+    }
+    if (fenceConfig.locked) {
+      win._setLockedBounds(win.getBounds());
+      win.webContents.send('locked-state-changed', true);
     }
   });
   openFences.set(fenceId, win);
@@ -725,6 +753,34 @@ function createManager() {
 // ─────────────────────────────────────────────
 // MANAGER
 // ─────────────────────────────────────────────
+
+ipcMain.on('move-window', (evt, dx, dy) => {
+  const win = BrowserWindow.fromWebContents(evt.sender);
+  if (!win || win.isDestroyed()) return;
+  const [x, y] = win.getPosition();
+  win.setPosition(x + dx, y + dy);
+});
+
+ipcMain.on('set-content-height', (evt, height) => {
+  const win = BrowserWindow.fromWebContents(evt.sender);
+  if (!win || win.isDestroyed()) return;
+  // Ne pas auto-redimensionner si la fence est enroulée
+  const fenceId = [...openFences.entries()].find(([, w]) => w === win)?.[0];
+  if (fenceId) {
+    const cfg = readConfig();
+    const f = cfg.fences.find(x => x.id === fenceId);
+    if (f?.rolled) return;
+  }
+  const newH = Math.max(TITLE_HEIGHT, Math.round(height));
+  const b = win.getBounds();
+  // DWM trick : déverrouiller le minimum avant de réduire
+  win.setMinimumSize(FENCE_MIN_W, TITLE_HEIGHT);
+  win.setResizable(false);
+  win.setBounds({ x: b.x, y: b.y, width: b.width + 1, height: newH }, false);
+  win.setBounds({ x: b.x, y: b.y, width: b.width, height: newH }, false);
+  win.setResizable(true);
+  win.setMinimumSize(FENCE_MIN_W, newH);
+});
 
 ipcMain.handle("manager-minimize", (evt) => {
   BrowserWindow.fromWebContents(evt.sender)?.minimize();
@@ -1839,13 +1895,13 @@ async function getLnkIcon(lnkPath) {
 
       // Utiliser getBounds() comme source unique de vérité (position + taille)
       const b = win.getBounds();
-      const MIN_W = 420;
+      const MIN_W = FENCE_MIN_W;
 
       // Respecter le minHeight selon l'état roulé de la fence
       const fenceId = [...openFences.entries()].find(([, w]) => w === win)?.[0];
       const cfg = fenceId ? readConfig() : null;
       const fenceCfg = cfg?.fences.find(f => f.id === fenceId);
-      const MIN_H = fenceCfg?.rolled ? TITLE_HEIGHT : 300;
+      const MIN_H = fenceCfg?.rolled ? TITLE_HEIGHT : 80;
 
       // Limiter à la taille de l'écran courant
       const display = screen.getDisplayMatching(b);
@@ -2072,7 +2128,7 @@ async function getLnkIcon(lnkPath) {
       f.rolled = false;
       delete f.unrolledHeight;
       writeConfig(cfg);
-      win.setMinimumSize(420, 300);
+      win.setMinimumSize(FENCE_MIN_W, 300);
       win.setBounds({ x: b.x, y: b.y, width: b.width, height: savedHeight });
       win.webContents.send('rolled-state-changed', false);
       return false; // nouveau état : pas roulé
@@ -2081,11 +2137,32 @@ async function getLnkIcon(lnkPath) {
       f.rolled = true;
       f.unrolledHeight = b.height;
       writeConfig(cfg);
-      win.setMinimumSize(420, TITLE_HEIGHT);
+      win.setMinimumSize(FENCE_MIN_W, TITLE_HEIGHT);
       win.setBounds({ x: b.x, y: b.y, width: b.width, height: TITLE_HEIGHT });
       win.webContents.send('rolled-state-changed', true);
       return true; // nouveau état : roulé
     }
+  });
+
+  ipcMain.handle('fence-set-locked', (_evt, fenceId, locked) => {
+    if (!isValidFenceId(fenceId)) return;
+    const win = openFences.get(fenceId);
+    if (!win || win.isDestroyed()) return;
+
+    const cfg = readConfig();
+    const f = cfg.fences.find(x => x.id === fenceId);
+    if (!f) return;
+
+    f.locked = locked;
+    writeConfig(cfg);
+
+    if (locked) {
+      win._setLockedBounds(win.getBounds());
+    } else {
+      win._setLockedBounds(null);
+    }
+
+    win.webContents.send('locked-state-changed', locked);
   });
 
   ipcMain.handle("get-autostart", () => {
@@ -2467,6 +2544,9 @@ async function getLnkIcon(lnkPath) {
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createManager();
     });
+
+    // ── Mise à jour automatique ──
+    autoUpdater.checkForUpdatesAndNotify();
   });
 
   app.on('before-quit', () => {
