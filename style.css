@@ -104,6 +104,23 @@ body {
   box-sizing: border-box;
 }
 
+/* Masque pendant refresh async: évite de voir le bureau derrière */
+.refresh-scrim {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+  pointer-events: none;
+  user-select: none;
+  color: rgba(255, 255, 255, 0.2);
+  font-size: 12px;
+  letter-spacing: 0.03em;
+}
+
 #container.drop-hint {
   background: var(--bg-hover);
   outline: 2px dashed var(--accent);

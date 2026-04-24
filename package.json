@@ -1,6 +1,6 @@
 {
   "name": "boxes",
-  "version": "3.2.2",
+  "version": "3.3.0",
   "description": "Application de gestion de box multiples",
   "main": "main.js",
   "author": {
@@ -9,6 +9,9 @@
   },
   "scripts": {
     "start": "electron .",
+    "stop": "electron . --quit-now",
+    "rebuild-native": "electron-rebuild -f -w shell_utils -m native",
+    "rebuild:clean": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"npm run stop; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run rebuild-native; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run dist\"",
     "dist": "electron-builder --win nsis --x64",
     "dist:portable": "electron-builder --win portable --x64"
   },
@@ -40,7 +43,8 @@
       "manager-style.css",
       "assets/icon.ico",
       "assets/icons/**",
-      "node_modules/**"
+      "node_modules/**",
+      "native/build/Release/shell_utils.node"
     ],
     "win": {
       "target": [
@@ -85,7 +89,10 @@
       }
     ],
     "afterPack": "./afterPack.js",
-    "asar": false,
+    "asar": true,
+    "asarUnpack": [
+      "**/*.node"
+    ],
     "publish": {
       "provider": "github",
       "owner": "frajajo",

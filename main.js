@@ -14,11 +14,18 @@ const { createCanvas } = require("canvas");
 const os = require("os");
 const crypto = require("crypto");
 
-// ── DEBUG FILE LOGGER ──
 function debugLog() {}
 
 const { pathToFileURL } = require("url");
 const { autoUpdater } = require('electron-updater');
+
+// ── Addon natif Windows ──
+let shellUtils = null;
+try {
+  shellUtils = require('./native/build/Release/shell_utils');
+} catch (e) {
+  console.warn('[shell_utils] addon non disponible:', e.message);
+}
 
 // ─────────────────────────────────────────────
 // Cache disque des icônes (PNG) — rapide + persistant
@@ -93,6 +100,52 @@ function dataUrlToBuffer(dataURL) {
   } catch {
     return null;
   }
+}
+
+// Convertit le résultat de shellUtils.getFileIconPng (buffer RGBA) en data URL
+// Détecte la zone de contenu réelle et la recadre si elle est petite dans le canvas
+function shellIconToDataURL(iconData, targetSize = 256) {
+  if (!iconData || !iconData.data) return null;
+  try {
+    const { width, height, data } = iconData;
+
+    // Canvas source avec les pixels bruts
+    const src = createCanvas(width, height);
+    const srcCtx = src.getContext('2d');
+    const imgData = srcCtx.createImageData(width, height);
+    imgData.data.set(data);
+    srcCtx.putImageData(imgData, 0, 0);
+
+    const dst = createCanvas(targetSize, targetSize);
+    const dstCtx = dst.getContext('2d');
+
+    // Trouver la bounding box du contenu opaque (seuil >100 pour ignorer l'anti-aliasing léger)
+    let minX = width, maxX = 0, minY = height, maxY = 0;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (data[(y * width + x) * 4 + 3] > 100) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+
+    if (maxX >= minX && maxY >= minY) {
+      const contentW = maxX - minX + 1;
+      const contentH = maxY - minY + 1;
+      if (contentW < width * 0.6 || contentH < height * 0.6) {
+        dstCtx.drawImage(src, minX, minY, contentW, contentH, 0, 0, targetSize, targetSize);
+      } else {
+        dstCtx.drawImage(src, 0, 0, targetSize, targetSize);
+      }
+    } else {
+      dstCtx.drawImage(src, 0, 0, targetSize, targetSize);
+    }
+
+    return dst.toDataURL('image/png');
+  } catch { return null; }
 }
 
 async function getIconDataURLInternal(filePath, size) {
@@ -211,7 +264,15 @@ if (!gotTheLock) {
   // Une vraie instance tourne -> la mettre au premier plan et quitter
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, commandLine) => {
+    // Permet de fermer proprement l'instance existante depuis une 2e invocation:
+    // `electron . --quit-now` (utilisé par `npm run stop`)
+    if (Array.isArray(commandLine) && commandLine.includes('--quit-now')) {
+      app.isQuitting = true;
+      app.quit();
+      return;
+    }
+
     const allWins = BrowserWindow.getAllWindows();
     const mgr = allWins.find(w => { try { return w.getTitle().includes('Manager'); } catch { return false; } });
     if (mgr) { if (mgr.isMinimized()) mgr.restore(); mgr.focus(); }
@@ -468,6 +529,96 @@ const FENCE_MIN_W = 160;  // largeur minimale d'une fence
 // États
 const openFences = new Map();
 let draggedItem = null;
+let lastDragPlaceholderBaseName = null; // basename du placeholder startDrag courant (inter-box / bureau)
+let lastDragPlaceholderPath = null; // chemin complet du placeholder (inter-box)
+let _desktopDropPollTimer = null;
+
+// ── OLE DropTarget → handlers (inter-box + fichiers externes) ────────────────
+async function movePathsBetweenFences(filePaths, sourceFenceId, targetFenceId) {
+  if (!Array.isArray(filePaths) || !filePaths.length) return false;
+  if (!isValidFenceId(sourceFenceId) || !isValidFenceId(targetFenceId)) return false;
+  if (sourceFenceId === targetFenceId) return false;
+
+  const targetDir = path.join(FENCES_BASE_DIR, targetFenceId);
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  let moved = 0;
+  for (const fp of filePaths) {
+    try {
+      const p = path.normalize(fp);
+      if (!isPathInFences(p)) continue;
+      const fileName = path.basename(p);
+      const dest = ensureUniqueDest(path.join(targetDir, fileName));
+      await fs.promises.rename(p, dest);
+      moved++;
+    } catch {}
+  }
+
+  if (openFences.has(sourceFenceId)) openFences.get(sourceFenceId).webContents.send("fence-refresh");
+  if (openFences.has(targetFenceId)) openFences.get(targetFenceId).webContents.send("fence-refresh");
+  return moved > 0;
+}
+
+async function copyExternalPathsToFence(filePaths, targetFenceId) {
+  if (!Array.isArray(filePaths) || !filePaths.length) return false;
+  if (!isValidFenceId(targetFenceId)) return false;
+
+  const dir = path.join(FENCES_BASE_DIR, targetFenceId);
+  fs.mkdirSync(dir, { recursive: true });
+  let copied = 0;
+
+  for (const fp of filePaths) {
+    try {
+      if (!fp || typeof fp !== "string") continue;
+      if (!fs.existsSync(fp)) continue;
+      const destName = sanitizeFileName(path.basename(fp));
+      const destPath = ensureUniqueDest(path.join(dir, destName));
+      const st = fs.lstatSync(fp);
+      if (st.isDirectory()) {
+        await fs.promises.cp(fp, destPath, { recursive: true });
+      } else {
+        try {
+          await fs.promises.copyFile(fp, destPath);
+        } catch {
+          await streamCopy(fp, destPath);
+        }
+      }
+      copied++;
+    } catch {}
+  }
+
+  if (openFences.has(targetFenceId)) openFences.get(targetFenceId).webContents.send("fence-refresh");
+  return copied > 0;
+}
+
+function attachOleDropTargetToFenceWindow(win, fenceId) {
+  if (!shellUtils?.registerDropTarget || !shellUtils?.revokeDropTarget) return;
+  try {
+    const handle = win.getNativeWindowHandle(); // Buffer
+    const ok = shellUtils.registerDropTarget(handle, async (payload) => {
+      try {
+        if (!payload || typeof payload !== "object") return;
+        if (payload.kind === "internal" && typeof payload.internal === "string") {
+          const lines = payload.internal.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+          const sourceFenceId = lines.shift();
+          const paths = lines;
+          await movePathsBetweenFences(paths, sourceFenceId, fenceId);
+          return;
+        }
+        if (payload.kind === "files" && Array.isArray(payload.files)) {
+          await copyExternalPathsToFence(payload.files, fenceId);
+        }
+      } catch {}
+    });
+    if (!ok) {
+      try { console.warn("[ole-drop-target] register failed for fence", fenceId); } catch {}
+      return;
+    }
+    win.on('closed', () => {
+      try { shellUtils.revokeDropTarget(handle); } catch {}
+    });
+  } catch {}
+}
 
 // ─────────────────────────────────────────────
 // CONFIG
@@ -615,6 +766,22 @@ function createFence(fenceId, fenceName) {
     },
   });
 
+  // Activer le drop OLE sur cette box (inter-box + drop Explorer)
+  attachOleDropTargetToFenceWindow(win, fenceId);
+
+  // Sécurité navigation : aucune ouverture/navigations externes depuis le renderer.
+  // (deny-by-default)
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (e, url) => {
+    // Autoriser uniquement les navigations vers nos fichiers locaux.
+    // Tout le reste est bloqué.
+    try {
+      if (!url || typeof url !== 'string') { e.preventDefault(); return; }
+      if (url.startsWith('file:')) return;
+    } catch {}
+    e.preventDefault();
+  });
+
   // sauvegarde position/taille
   let saveTimer = null;
   const queueSave = () => {
@@ -639,27 +806,33 @@ function createFence(fenceId, fenceName) {
 
   // Position de référence quand la fence est verrouillée
   let lockedBounds = null;
+  let lockSuspended = false;
 
   win.on("move", () => {
-    if (lockedBounds) {
-      // Remettre immédiatement à la position verrouillée
+    if (lockedBounds && !lockSuspended) {
       win.setBounds(lockedBounds);
       return;
     }
-    queueSave();
+    if (!lockedBounds) queueSave();
   });
 
   win.on("resize", () => {
-    if (lockedBounds) {
+    if (lockedBounds && !lockSuspended) {
       win.setBounds(lockedBounds);
       return;
     }
-    queueSave();
+    if (!lockedBounds) queueSave();
   });
 
   // Exposer lockedBounds pour le handler IPC fence-set-locked
   win._lockedBounds = () => lockedBounds;
   win._setLockedBounds = (b) => { lockedBounds = b; };
+  win._suspendLock = () => { lockSuspended = true; };
+  win._clearLockSuspend = () => { lockSuspended = false; };
+  win._resumeLock = () => {
+    lockSuspended = false;
+    if (lockedBounds) win.setBounds(lockedBounds);
+  };
 
   win.on("close", () => {
     try {
@@ -723,6 +896,16 @@ function createManager() {
     },
   });
 
+  // Sécurité navigation : aucune ouverture/navigations externes depuis le renderer.
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (e, url) => {
+    try {
+      if (!url || typeof url !== 'string') { e.preventDefault(); return; }
+      if (url.startsWith('file:')) return;
+    } catch {}
+    e.preventDefault();
+  });
+
   win.loadFile("manager.html");
   win.once("ready-to-show", () => { try { win.setIcon(APP_ICON); app.setIcon && app.setIcon(APP_ICON); } catch { } });
 
@@ -770,6 +953,20 @@ ipcMain.on('set-content-height', (evt, height) => {
     const cfg = readConfig();
     const f = cfg.fences.find(x => x.id === fenceId);
     if (f?.rolled) return;
+    if (f?.locked) {
+      // Suspendre le verrou le temps d'afficher le panel
+      win._suspendLock?.();
+      const newH = Math.max(TITLE_HEIGHT, Math.round(height));
+      const b = win.getBounds();
+      win.setMinimumSize(FENCE_MIN_W, TITLE_HEIGHT);
+      win.setResizable(false);
+      win.setBounds({ x: b.x, y: b.y, width: b.width + 1, height: newH }, false);
+      win.setBounds({ x: b.x, y: b.y, width: b.width, height: newH }, false);
+      win.setResizable(true);
+      win.setMinimumSize(FENCE_MIN_W, newH);
+      setTimeout(() => { win._clearLockSuspend?.(); }, 50);
+      return;
+    }
   }
   const newH = Math.max(TITLE_HEIGHT, Math.round(height));
   const b = win.getBounds();
@@ -780,6 +977,12 @@ ipcMain.on('set-content-height', (evt, height) => {
   win.setBounds({ x: b.x, y: b.y, width: b.width, height: newH }, false);
   win.setResizable(true);
   win.setMinimumSize(FENCE_MIN_W, newH);
+});
+
+ipcMain.on('restore-locked-bounds', (evt) => {
+  const win = BrowserWindow.fromWebContents(evt.sender);
+  if (!win || win.isDestroyed()) return;
+  win._resumeLock?.();
 });
 
 ipcMain.handle("manager-minimize", (evt) => {
@@ -1368,6 +1571,27 @@ function expandEnvVars(p) {
   return p.replace(/%([^%]+)%/g, (_, varName) => process.env[varName] || `%${varName}%`);
 }
 
+// Marque un fichier comme caché (Hidden+System) — best-effort Windows.
+// Objectif: si le placeholder est copié/déplacé sur le bureau pendant un drag,
+// il restera invisible même si l'Explorer rafraîchit tardivement.
+async function markFileHiddenSystemBestEffort(filePath) {
+  if (process.platform !== 'win32') return;
+  if (!filePath) return;
+  try {
+    // Priorité 1 : addon natif (immédiat)
+    shellUtils?.hideFileNow?.(filePath);
+  } catch {}
+  try {
+    // Priorité 2 : attrib via cmd (commande interne)
+    // /c : exécute puis quitte
+    await execFileAsync(
+      'cmd.exe',
+      ['/c', 'attrib', '+H', '+S', filePath],
+      { windowsHide: true, timeout: 2000 }
+    );
+  } catch {}
+}
+
 async function getLnkIcon(lnkPath) {
   // 0) Icône assignée manuellement — priorité absolue, ignore le cache
   const userIcon = getUserIconDataURL(lnkPath);
@@ -1510,20 +1734,27 @@ async function getLnkIcon(lnkPath) {
 
   ipcMain.handle('get-file-icon-large', async (_evt, filePath) => {
     try {
-      // Essayer d'abord la miniature système haute résolution (256×256)
-      // pour les fichiers qui ne sont pas des raccourcis
-      if (!/\.lnk$/i.test(filePath)) {
+      // ── Priorité 1 : addon natif → icône jumbo Shell 256×256 ──
+      if (shellUtils) {
+        try {
+          const iconData = shellUtils.getFileIconPng(filePath, 256);
+          const dataURL = shellIconToDataURL(iconData);
+          if (dataURL) return dataURL;
+        } catch { }
+      }
+
+      // ── Priorité 2 : miniature Electron (images, vidéos, docs) ──
+      if (!/\.lnk$/i.test(filePath) && !/\.html?$/i.test(filePath)) {
         try {
           const thumb = await nativeImage.createThumbnailFromPath(filePath, { width: 256, height: 256 });
           if (thumb && !thumb.isEmpty()) {
             const size = thumb.getSize();
-            // N'utiliser que si la miniature est vraiment en haute résolution (>= 48px)
-            if (size.width >= 48 || size.height >= 48) {
-              return thumb.toDataURL();
-            }
+            if (size.width >= 48 || size.height >= 48) return thumb.toDataURL();
           }
         } catch { }
       }
+
+      // ── Priorité 3 : fallback app.getFileIcon ──
       return await getCachedIconURL(filePath, 'large');
     } catch (e) {
       console.warn('[get-file-icon-large] failed for', filePath, e);
@@ -1646,49 +1877,118 @@ async function getLnkIcon(lnkPath) {
   });
 
   // Drag natif : permet de déposer un fichier depuis une box vers le bureau ou l'explorateur
-  ipcMain.handle("native-drag-start", async (evt, filePaths) => {
+  ipcMain.handle("native-drag-start", async (evt, payload) => {
     try {
+      const { filePaths, fenceId } = (payload && typeof payload === 'object') ? payload : { filePaths: payload, fenceId: null };
       // Accepte un chemin unique (string) ou un tableau
       const paths = Array.isArray(filePaths) ? filePaths : [filePaths];
       if (!paths.length) return false;
 
-      // Valider le premier chemin pour récupérer l'icône
-      const firstValid = paths.find(fp => {
+      // Ne conserver que des chemins valides issus des fences
+      const validPaths = paths.filter(fp => {
         if (!fp || typeof fp !== 'string') return false;
         const p = path.normalize(fp);
         return fs.existsSync(p) && isPathInFences(p);
       });
-      if (!firstValid) return false;
-      const firstNorm = path.normalize(firstValid);
+      if (!validPaths.length) return false;
 
       const win = BrowserWindow.fromWebContents(evt.sender);
       if (!win || win.isDestroyed()) return false;
 
-      // Icône du premier fichier (obligatoire pour startDrag)
+      const srcFenceId = (typeof fenceId === 'string' && isValidFenceId(fenceId)) ? fenceId : null;
+
+      // NOTE:
+      // Le DropTarget OLE ne s'enregistre pas chez certains utilisateurs, donc le drag inter-box
+      // doit rester sur placeholder `startDrag`. On utilise donc placeholder pour TOUT drag
+      // qui part d'une fence, et on finalise le drop sur le bureau via dragend (détection du placeholder).
+      const winClass = (() => {
+        try { return shellUtils?.getWindowClassUnderCursor?.(); } catch { return null; }
+      })();
+
+      // Fallback : ancienne méthode placeholder si l'addon n'a pas startFileDrag
+      // ou si on est au-dessus d'une autre box (drag inter-box).
+      if (winClass) { try { console.log('[native-drag-start] placeholder; winClass=', winClass); } catch {} }
+      const firstNorm = path.normalize(validPaths[0]);
       let icon;
       try {
         icon = await app.getFileIcon(firstNorm, { size: 'small' });
         if (!icon || icon.isEmpty()) icon = null;
       } catch { icon = null; }
-
       if (!icon) {
-        icon = nativeImage.createFromBuffer(
-          Buffer.from(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12Ng" +
-            "AAIABQABNl7BcQAAAABJRU5ErkJggg==", "base64"
-          )
-        );
+        icon = nativeImage.createFromBuffer(Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNl7BcQAAAABJRU5ErkJggg==",
+          "base64"
+        ));
       }
-
       if (win.isDestroyed() || win.webContents.isDestroyed()) return false;
-
-      // On passe un fichier TEMPORAIRE vide à startDrag — pas le vrai fichier.
-      // Cela active la reconnaissance du drag entre BrowserWindows par l'OS,
-      // sans risquer qu'un drop accidentel sur le bureau copie le vrai fichier.
-      // Le vrai déplacement est toujours géré par fenceDragDrop via IPC.
-      const tmpFile = path.join(os.tmpdir(), '.boxes-drag-placeholder');
+      // ⚠️ Certains environnements bloquent la création d'un nom fixe dans %TEMP% (EPERM).
+      // Utiliser un nom unique à chaque drag évite les conflits/locks/policies.
+      const tmpFile = path.join(
+        os.tmpdir(),
+        `boxes-drag-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.tmp`
+      );
       fs.writeFileSync(tmpFile, '');
+      await markFileHiddenSystemBestEffort(tmpFile);
+      lastDragPlaceholderBaseName = path.basename(tmpFile);
+      lastDragPlaceholderPath = tmpFile;
       win.webContents.startDrag({ file: tmpFile, icon });
+
+      // ── Finalisation bureau côté MAIN (évite throttling renderer) ──────────
+      // Problème observé: si l'utilisateur ne bouge pas la souris après le drop,
+      // le renderer peut être throttlé et ne pas lancer extractToDesktop tout de suite.
+      // Ici on poll le bureau et on finalise dès que le placeholder apparaît.
+      try {
+        if (_desktopDropPollTimer) {
+          clearInterval(_desktopDropPollTimer);
+          _desktopDropPollTimer = null;
+        }
+        const desktop = app.getPath('desktop');
+        const startedAt = Date.now();
+        const name = lastDragPlaceholderBaseName;
+        _desktopDropPollTimer = setInterval(async () => {
+          try {
+            if (!name) return;
+            const p = path.join(desktop, name);
+            if (!fs.existsSync(p)) {
+              if (Date.now() - startedAt > 35000) {
+                console.log('[desktop-drop] timeout waiting placeholder', name);
+                clearInterval(_desktopDropPollTimer);
+                _desktopDropPollTimer = null;
+              }
+              return;
+            }
+
+            console.log('[desktop-drop] placeholder detected after', Date.now() - startedAt, 'ms');
+            clearInterval(_desktopDropPollTimer);
+            _desktopDropPollTimer = null;
+
+            // Nettoyer le placeholder rapidement
+            try { shellUtils?.hideFileNow?.(p); } catch {}
+            try { fs.unlinkSync(p); shellUtils?.notifyShellDelete?.(p); } catch {}
+
+            // Finaliser le move réel vers le bureau si on a un drag en cours
+            if (!draggedItem || !Array.isArray(draggedItem.filePaths) || draggedItem.filePaths.length === 0) return;
+            const toMove = [...draggedItem.filePaths];
+            const srcFence = draggedItem.fenceId;
+            draggedItem = null;
+
+            for (const fp of toMove) {
+              try {
+                const src = path.normalize(fp);
+                if (!isPathInFences(src)) continue;
+                const dest = ensureUniqueDest(path.join(desktop, path.basename(src)));
+                await fs.promises.rename(src, dest);
+                shellUtils?.notifyShellCreate?.(dest);
+                shellUtils?.notifyShellDelete?.(src);
+              } catch {}
+            }
+            if (srcFence && openFences.has(srcFence)) {
+              openFences.get(srcFence).webContents.send("fence-refresh");
+            }
+          } catch {}
+        }, 100);
+      } catch {}
+
       return true;
     } catch (e) {
       console.warn("[native-drag-start] failed (non-fatal):", e.message);
@@ -1696,8 +1996,64 @@ async function getLnkIcon(lnkPath) {
     }
   });
 
+  // NOTE: le démarrage du drag OLE est fait côté preload (renderer process).
+  // Le lancer depuis le main process a provoqué un crash natif (0xC0000005).
+
+  ipcMain.on('cleanup-drag-placeholder', () => {
+    const desktop = app.getPath('desktop');
+    const candidates = [
+      lastDragPlaceholderBaseName,
+      'boxes-drag-placeholder.tmp', // compat ancien nom
+    ].filter(Boolean);
+
+    const doClean = () => {
+      try {
+        for (const name of candidates) {
+          const desktopFile = path.join(desktop, name);
+          if (fs.existsSync(desktopFile)) {
+            fs.unlinkSync(desktopFile);
+            // Notifier le Shell Windows pour effacer l'icône immédiatement
+            shellUtils?.notifyShellDelete(desktopFile);
+            return true;
+          }
+        }
+      } catch {}
+      return false;
+    };
+    // Polling toutes les 200ms pendant 15s max
+    let attempts = 0;
+    const interval = setInterval(() => {
+      attempts++;
+      if (doClean() || attempts >= 75) clearInterval(interval);
+    }, 200);
+  });
+
   ipcMain.handle("is-inter-fence-drag", () => {
     return draggedItem !== null;
+  });
+
+  // Vérifie si le placeholder de drag est sur le bureau (= dépôt effectif sur le bureau).
+  // Retourne true immédiatement sans bloquer, supprime le placeholder en arrière-plan.
+  ipcMain.handle("drag-dropped-on-desktop", () => {
+    const desktop = app.getPath('desktop');
+    const candidates = [
+      lastDragPlaceholderBaseName,
+      'boxes-drag-placeholder.tmp', // compat ancien nom
+    ].filter(Boolean);
+
+    for (const name of candidates) {
+      const p = path.join(desktop, name);
+      if (!fs.existsSync(p)) continue;
+      shellUtils?.hideFileNow?.(p);
+      const tryDelete = (attempts) => {
+        fs.promises.unlink(p)
+          .then(() => shellUtils?.notifyShellDelete(p))
+          .catch(() => { if (attempts > 0) setTimeout(() => tryDelete(attempts - 1), 500); });
+      };
+      tryDelete(20);
+      return true;
+    }
+    return false;
   });
 
   ipcMain.handle("fence-drag-cancel", () => {
@@ -1754,6 +2110,14 @@ async function getLnkIcon(lnkPath) {
         openFences.get(sourceFenceId).webContents.send("fence-refresh");
       }
 
+      // Nettoyer le placeholder inter-box (créé par startDrag)
+      try {
+        if (lastDragPlaceholderPath && fs.existsSync(lastDragPlaceholderPath)) {
+          fs.unlinkSync(lastDragPlaceholderPath);
+        }
+      } catch {}
+      lastDragPlaceholderPath = null;
+
       draggedItem = null;
       console.log('[fence-drag-drop] success —', results.length, 'file(s) moved');
       return results.length > 0 ? results : null;
@@ -1796,6 +2160,8 @@ async function getLnkIcon(lnkPath) {
 
       if (move) {
         await fs.promises.rename(p, dest);
+        shellUtils?.notifyShellCreate(dest);
+        shellUtils?.notifyShellDelete(p);
       } else {
         if (st.isDirectory()) {
           await fs.promises.cp(p, dest, { recursive: true });
@@ -1873,7 +2239,14 @@ async function getLnkIcon(lnkPath) {
 
       // Déplacer le fichier original dans ce dossier
       const fileName = path.basename(srcNorm);
-      const dest = ensureUniqueDest(path.join(boxFolder, fileName));
+      const dest = path.join(boxFolder, fileName);
+
+      // Si le fichier existe déjà dans le dossier de la box, l'écraser (au lieu de créer " (1)")
+      try {
+        if (fs.existsSync(dest)) {
+          await fs.promises.rm(dest, { recursive: true, force: true });
+        }
+      } catch {}
 
       await fs.promises.rename(srcNorm, dest);
 
@@ -2498,7 +2871,25 @@ async function getLnkIcon(lnkPath) {
   }
 
   app.whenReady().then(() => {
+    // Si on lance en "stop", quitter immédiatement sans créer de fenêtres.
+    if (process.argv.includes('--quit-now')) {
+      app.isQuitting = true;
+      app.quit();
+      return;
+    }
 
+    // Nettoyer tout placeholder résiduel sur le bureau (peut bloquer les drops natifs)
+    try {
+      const desktop = app.getPath('desktop');
+      for (const entry of (fs.readdirSync(desktop) || [])) {
+        if (entry === 'boxes-drag-placeholder.tmp' || /^boxes-drag-.*\.tmp$/i.test(entry)) {
+          const residual = path.join(desktop, entry);
+          try { fs.renameSync(residual, path.join(os.tmpdir(), `boxes-drag-cleanup-${Date.now()}-${entry}`)); }
+          catch { try { fs.unlinkSync(residual); } catch {} }
+          shellUtils?.notifyShellDelete(residual);
+        }
+      }
+    } catch {}
 
     createDesktopShortcutIfNeeded();
     ensureBaseDir();

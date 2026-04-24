@@ -34,6 +34,10 @@ let sortMode = 'none'; // 'none' | 'name' | 'type' | 'date'
 let sortAsc = true;
 let manualOrder = []; // ordre manuel persisté (basenames)
 
+// Évite un "flash vide" lors des déplacements OLE (FS pas encore à jour)
+let _lastNonEmptyAt = 0;
+let _refreshTimer = null;
+
 // ───────────────────────────────────────────────
 // Initialisation : récupérer l'ID de la fence
 // ───────────────────────────────────────────────
@@ -93,8 +97,11 @@ let manualOrder = []; // ordre manuel persisté (basenames)
 
     await loadFenceItems();
 
-    // Rafraîchir si une autre fence a déplacé un fichier ici
-    window.api.onFenceRefresh(() => loadFenceItems());
+    // Rafraîchir si une autre fence a déplacé un fichier ici (debounce pour éviter flash)
+    window.api.onFenceRefresh(() => {
+      clearTimeout(_refreshTimer);
+      _refreshTimer = setTimeout(() => { loadFenceItems(); }, 120);
+    });
 
     // Mettre à jour la taille des icônes en temps réel
     window.api.onIconSizeChanged(async (size) => {
@@ -241,22 +248,31 @@ container.addEventListener('drop', async (e) => {
   container.classList.remove('drop-inter');
   if (!currentFenceId) return;
 
-
   // Lire files AVANT tout await — dataTransfer est vidé dès qu'on perd la main
   const files = Array.from(e.dataTransfer?.files ?? []);
+  try {
+    console.log('[container drop] fence', currentFenceId, 'files:', files.map(f => (f?.path || f?.name || '')));
+  } catch {}
 
-  // isInterFenceDrag est la source de vérité — il prime sur files.length
-  const isInterFence = await window.api.isInterFenceDrag();
+  // Le drag inter-box est géré en OLE au niveau natif (drop target) :
+  // ici, on ne traite que les drops externes HTML5 (explorateur/navigateur) sur le container.
 
-  if (isInterFence) {
-    // ── Cas drag inter-fences (toujours prioritaire)
-    container.querySelectorAll('.icon.dragging').forEach(el => { el._dropHandled = true; });
-    const destPaths = await window.api.fenceDragDrop(currentFenceId);
-    if (destPaths && destPaths.length > 0) {
+  // Inter-box via placeholder startDrag: Windows dépose un fichier temp `boxes-drag-*.tmp`
+  // dans `dataTransfer.files`. Dans ce cas, on demande au main de finaliser le move.
+  try {
+    const maybeInter = await window.api.isInterFenceDrag?.();
+    const hasTmp = files.some(f => {
+      const name = (f?.path || f?.name || '').split(/[\\/]/).pop() || '';
+      return /^boxes-drag-.*\.tmp$/i.test(name) || name.toLowerCase() === 'boxes-drag-placeholder.tmp';
+    });
+    try { console.log('[container drop] maybeInter=', maybeInter, 'hasTmp=', hasTmp); } catch {}
+    if (maybeInter || hasTmp) {
+      await window.api.fenceDragDrop?.(currentFenceId);
+      await window.api.cleanupDragPlaceholder?.();
       await loadFenceItems();
+      return;
     }
-    return;
-  }
+  } catch {}
 
   if (files.length > 0) {
     // ── Cas fichiers externes (explorateur / bureau / navigateur web)
@@ -390,15 +406,26 @@ function showContextMenu(filePath, x, y) {
   const mw = menu.offsetWidth || 210;
   const mh = menu.offsetHeight || 190;
   const left = (x + mw > window.innerWidth) ? window.innerWidth - mw - 4 : x;
-  const top = (y + mh > window.innerHeight) ? window.innerHeight - mh - 4 : y;
   menu.style.left = `${Math.max(0, left)}px`;
-  menu.style.top = `${Math.max(0, top)}px`;
+  menu.style.top = `${Math.max(0, y)}px`;
 
-  const close = () => menu.remove();
-  // Fermer sur clic gauche OU clic droit ailleurs
+  // Agrandir la fenêtre pour que le menu soit entièrement visible
+  window.api.setContentHeight(y + mh + 8);
+
+  const close = () => {
+    if (!document.body.contains(menu)) return; // déjà retiré par un nouveau clic droit
+    menu.remove();
+    if (isLocked) {
+      window.api.restoreLockedBounds();
+    } else {
+      autoResize();
+    }
+  };
+  // Fermer sur clic gauche, clic droit ailleurs, ou perte de focus
   setTimeout(() => {
     window.addEventListener('click', close, { once: true });
     window.addEventListener('contextmenu', close, { once: true });
+    window.addEventListener('blur', close, { once: true });
   }, 0);
 
   menu.addEventListener('click', async (ev) => {
@@ -699,10 +726,13 @@ function buildStyleMenu() {
     const isOpening = panel.style.display === 'none';
     panel.style.display = isOpening ? 'block' : 'none';
     if (isOpening) {
-      // Agrandir la fenêtre pour que le panel soit entièrement visible
       window.api.setContentHeight(r.bottom + 4 + panel.offsetHeight + 8);
     } else {
-      autoResize();
+      if (isLocked) {
+        window.api.restoreLockedBounds();
+      } else {
+        autoResize();
+      }
     }
   });
 
@@ -820,23 +850,46 @@ async function sortItems(items) {
 async function loadFenceItems() {
   if (!currentFenceId) return;
 
-  // Supprimer uniquement les icônes et le placeholder, pas les poignées
-  container.querySelectorAll('.icon, .empty-placeholder').forEach(el => el.remove());
+  // Éviter un "flash" vide (fenêtre translucide) pendant les awaits.
+  // Sinon, on voit les icônes du bureau derrière et ça ressemble à un renommage.
+  let scrim = container.querySelector('.refresh-scrim');
+  if (!scrim) {
+    scrim = document.createElement('div');
+    scrim.className = 'refresh-scrim';
+    scrim.textContent = '...';
+    container.appendChild(scrim);
+  }
+  scrim.style.display = 'flex';
 
   let items = await window.api.listFenceItems(currentFenceId);
   items = await sortItems(items);
 
   // ── Placeholder si box vide ──
   if (items.length === 0) {
+    // Si on vient tout juste d'avoir des items, il s'agit souvent d'un état transitoire
+    // pendant un move OLE -> re-tenter rapidement sans réduire la fenêtre.
+    if (Date.now() - _lastNonEmptyAt < 1200) {
+      scrim.style.display = 'none';
+      setTimeout(() => { loadFenceItems(); }, 150);
+      return;
+    }
+    // On met à jour le DOM seulement une fois qu'on sait que c'est vraiment vide.
+    container.querySelectorAll('.icon, .empty-placeholder').forEach(el => el.remove());
     const ph = document.createElement('div');
     ph.className = 'empty-placeholder';
     ph.textContent = 'Glissez des fichiers ici';
     const resizeBr = document.getElementById('resize-br');
     if (resizeBr) container.insertBefore(ph, resizeBr);
     else container.appendChild(ph);
+    scrim.style.display = 'none';
     await autoResize();
     return;
   }
+  _lastNonEmptyAt = Date.now();
+
+  // Supprimer uniquement les icônes et le placeholder, pas les poignées
+  container.querySelectorAll('.icon, .empty-placeholder').forEach(el => el.remove());
+  scrim.style.display = 'none';
 
   // Insérer les icônes AVANT les poignées de redimensionnement
   const resizeBottom = document.getElementById('resize-bottom');
@@ -844,6 +897,57 @@ async function loadFenceItems() {
   // ── Variables pour le drag de réorganisation interne ──
   let dragSrcPath = null;
   let dragSrcPaths = []; // multi-sélection
+
+  // Token anti-race: ignorer les chargements d'icônes d'un ancien rendu
+  const renderToken = (window.__renderToken = (window.__renderToken ?? 0) + 1);
+
+  const loadIconAsync = async (fullPath, img) => {
+    try {
+      let dataURL = null;
+      const isLnk = /\.lnk$/i.test(fullPath);
+
+      if (isLnk) {
+        dataURL = await window.api.getFileIconLarge(fullPath);
+        if (!dataURL) dataURL = await window.api.getFileIcon(fullPath);
+      } else if (/\.url$/i.test(fullPath)) {
+        dataURL = await window.api.getFileIcon(fullPath);
+        const url = await window.api.getUrlFromFile(fullPath);
+        if (url) {
+          try {
+            const urlObj = new URL(url);
+            const domain = urlObj.hostname.replace('www.', '');
+            const firstLetter = domain.charAt(0).toUpperCase();
+            let hash = 0;
+            for (let i = 0; i < domain.length; i++) {
+              hash = domain.charCodeAt(i) + ((hash << 5) - hash);
+            }
+            const hue = Math.abs(hash % 360);
+            const svg = `<svg width="48" height="48" xmlns="http://www.w3.org/2000/svg">
+              <rect width="48" height="48" rx="8" fill="hsl(${hue}, 60%, 50%)"/>
+              <text x="24" y="34" text-anchor="middle" font-size="24" font-weight="bold" fill="white" font-family="Arial">${firstLetter}</text>
+            </svg>`;
+            if (!dataURL) dataURL = 'data:image/svg+xml;base64,' + btoa(svg);
+          } catch {}
+        }
+      } else if (/\.(jpe?g|png|gif|bmp|webp|avif)$/i.test(fullPath)) {
+        dataURL = await window.api.getFilePreview(fullPath);
+        if (!dataURL) dataURL = await window.api.readImageAsDataURL(fullPath);
+      } else if (/\.(pdf|indd|indt|ai|psd|psb|eps|prproj|aep|xd|docx|doc|xlsx|xls|pptx|ppt|odt|ods|odp|rtf|svg|mp4|mov|avi|mkv|wmv|mp3|flac|wav)$/i.test(fullPath)) {
+        dataURL = await window.api.getFilePreview(fullPath);
+        if (!dataURL) dataURL = await window.api.getFileIconLarge(fullPath);
+        if (!dataURL) dataURL = await window.api.getFileIcon(fullPath);
+      } else {
+        dataURL = await window.api.getFileIconLarge(fullPath);
+        if (!dataURL) dataURL = await window.api.getFileIcon(fullPath);
+      }
+
+      if (!dataURL) dataURL = await window.api.getFileIcon(fullPath);
+
+      // Si un nouveau rendu a commencé, ignorer
+      if (window.__renderToken !== renderToken) return;
+      if (dataURL && img && img.isConnected) img.src = dataURL;
+    } catch {}
+  };
 
   for (const fullPath of items) {
     const div = document.createElement('div');
@@ -855,59 +959,9 @@ async function loadFenceItems() {
     const img = document.createElement('img');
     img.style.width = sz + 'px';
     img.style.height = sz + 'px';
-
-    let dataURL = null;
-
-    // DEBUG: voir le chemin et la branche d'icone utilisee
-    const isLnk = /\.lnk$/i.test(fullPath);
-
-    // ── Raccourcis .lnk
-    if (isLnk) {
-      dataURL = await window.api.getFileIconLarge(fullPath);
-      if (!dataURL) dataURL = await window.api.getFileIcon(fullPath);
-    }
-    // ── Fichiers .url
-    else if (/\.url$/i.test(fullPath)) {
-      dataURL = await window.api.getFileIcon(fullPath);
-      const url = await window.api.getUrlFromFile(fullPath);
-      if (url) {
-        try {
-          const urlObj = new URL(url);
-          const domain = urlObj.hostname.replace('www.', '');
-          const firstLetter = domain.charAt(0).toUpperCase();
-          let hash = 0;
-          for (let i = 0; i < domain.length; i++) {
-            hash = domain.charCodeAt(i) + ((hash << 5) - hash);
-          }
-          const hue = Math.abs(hash % 360);
-          const svg = `<svg width="48" height="48" xmlns="http://www.w3.org/2000/svg">
-            <rect width="48" height="48" rx="8" fill="hsl(${hue}, 60%, 50%)"/>
-            <text x="24" y="34" text-anchor="middle" font-size="24" font-weight="bold" fill="white" font-family="Arial">${firstLetter}</text>
-          </svg>`;
-          if (!dataURL) dataURL = 'data:image/svg+xml;base64,' + btoa(svg);
-        } catch (e) {
-        }
-      }
-    }
-    // ── Images : miniature native
-    else if (/\.(jpe?g|png|gif|bmp|webp|avif)$/i.test(fullPath)) {
-      dataURL = await window.api.getFilePreview(fullPath);
-      if (!dataURL) dataURL = await window.api.readImageAsDataURL(fullPath);
-    }
-    // ── PDF, Adobe, Office et autres formats riches
-    else if (/\.(pdf|indd|indt|ai|psd|psb|eps|prproj|aep|xd|docx|doc|xlsx|xls|pptx|ppt|odt|ods|odp|rtf|svg|mp4|mov|avi|mkv|wmv|mp3|flac|wav)$/i.test(fullPath)) {
-      dataURL = await window.api.getFilePreview(fullPath);
-      if (!dataURL) dataURL = await window.api.getFileIconLarge(fullPath);
-      if (!dataURL) dataURL = await window.api.getFileIcon(fullPath);
-    }
-    // ── Tous les autres fichiers
-    else {
-      dataURL = await window.api.getFileIconLarge(fullPath);
-      if (!dataURL) dataURL = await window.api.getFileIcon(fullPath);
-    }
-
-    if (!dataURL) dataURL = await window.api.getFileIcon(fullPath);
-    if (dataURL) img.src = dataURL;
+    // Rendu immédiat: on charge l'icône en arrière-plan (sinon la box "freeze" 20-30s)
+    img.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNl7BcQAAAABJRU5ErkJggg==';
+    loadIconAsync(fullPath, img);
 
     const label = document.createElement('div');
     label.className = 'name';
@@ -916,22 +970,18 @@ async function loadFenceItems() {
     // Tooltip : nom de fichier complet avec extension (sans le chemin)
     div.title = fullPath.split(/[\\/]/).pop();
 
+    // Drag via HTML5 dragstart, puis lancement du drag OLE natif.
+    // (C'était l'état "rapide" qui fonctionnait.)
     div.draggable = true;
-
-    // ── Drag START
-    div.addEventListener('dragstart', async (e) => {
+    div.addEventListener('dragstart', (e) => {
       try {
-        e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData('text/plain', fullPath);
-        window.__interFenceDrag = false;
-        div._dropHandled = false;
-
-        // Utiliser l'icône du fichier comme fantôme de drag
-        const img = div.querySelector('img');
-        if (img) {
-          const size = img.naturalWidth || img.width || 48;
-          e.dataTransfer.setDragImage(img, size / 2, size / 2);
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', fullPath);
         }
+
+        window.__interFenceDrag = true;
+        div._dropHandled = false;
 
         // Multi-sélection : si l'élément draggé fait partie de la sélection,
         // on drag tous les sélectionnés ; sinon on sélectionne uniquement celui-ci
@@ -951,33 +1001,46 @@ async function loadFenceItems() {
           }
         });
 
-        // Snapshot des chemins AVANT tout await (la variable dragSrcPaths peut changer)
         const pathsSnapshot = [...dragSrcPaths];
 
-        // ⚠️ Enregistrer le listener dragleave AVANT le await fenceDragStart.
-        // Si on attend la réponse IPC, dragleave peut avoir déjà tiré (mouse quitte
-        // la fenêtre pendant le round-trip) et nativeDragStart ne serait jamais appelé.
-        const onDocLeave = (ev) => {
-          if (ev.relatedTarget) return;
-          document.removeEventListener('dragleave', onDocLeave);
-          window.__interFenceDrag = true;
-          window.api.nativeDragStart(pathsSnapshot).catch(() => {});
-        };
-        const onDocDrop = () => {
-          document.removeEventListener('dragleave', onDocLeave);
-          document.removeEventListener('drop', onDocDrop);
-          document.removeEventListener('dragend', onDocDrop);
-        };
-        document.addEventListener('dragleave', onDocLeave);
-        document.addEventListener('drop', onDocDrop, { once: true });
-        document.addEventListener('dragend', onDocDrop, { once: true });
+        // Démarrer le drag "inter-box" côté main (état global)
+        window.api.fenceDragStart?.(pathsSnapshot, currentFenceId).catch(() => {});
 
-        // Enregistrer le drag dans le main process pour inter-fence
-        // (après le listener pour éviter la race condition)
-        await window.api.fenceDragStart(pathsSnapshot, currentFenceId);
+        // Permettre un drop HTML5 entre fenêtres Boxes sans dépendre d'un DropTarget OLE
+        if (e.dataTransfer) {
+          try {
+            e.dataTransfer.setData('application/x-boxes-internal', JSON.stringify({
+              sourceFenceId: currentFenceId,
+              paths: pathsSnapshot,
+            }));
+          } catch {}
+        }
 
-      } catch (err) {
-      }
+        // Choisir stratégie:
+        // - Bureau/Explorer: OLE depuis preload (instantané)
+        // - Autre box: placeholder via main (inter-box)
+        const cls = window.api.getWindowClassUnderCursor?.();
+        const isExplorerOrDesktop =
+          typeof cls === 'string' && (
+            cls === 'CabinetWClass' ||
+            cls === 'ExploreWClass' ||
+            cls === 'WorkerW' ||
+            cls === 'Progman' ||
+            cls === 'SHELLDLL_DefView' ||
+            cls === 'SysListView32' ||
+            cls === 'DirectUIHWND'
+          );
+
+        if (isExplorerOrDesktop) {
+          // Empêcher le drag HTML5 de Chromium et lancer un vrai drag système.
+          try { e.preventDefault(); } catch {}
+          setTimeout(() => {
+            window.api.startOleDrag?.(pathsSnapshot, currentFenceId).catch(() => {});
+          }, 0);
+        } else {
+          window.api.nativeDragStart(pathsSnapshot, currentFenceId).catch(() => {});
+        }
+      } catch {}
     });
 
     // ── Drag OVER sur une icône (indicateur d'insertion avant/après)
@@ -1005,6 +1068,11 @@ async function loadFenceItems() {
 
     // ── Drop sur une icône (réorganisation interne)
     div.addEventListener('drop', async (e) => {
+      // Ne capturer le drop QUE pour la réorganisation interne.
+      // Si c'est un drop externe (Explorer/Bureau), laisser l'événement remonter
+      // jusqu'au listener sur #container qui gère l'ajout de fichiers.
+      if (!dragSrcPath || !items.includes(dragSrcPath)) return;
+
       e.preventDefault();
       e.stopPropagation();
 
@@ -1015,8 +1083,7 @@ async function loadFenceItems() {
       container.querySelectorAll('.icon.insert-before, .icon.insert-after')
         .forEach(el => { el.classList.remove('insert-before'); el.classList.remove('insert-after'); });
 
-      if (!dragSrcPath || dragSrcPaths.includes(fullPath)) return;
-      if (!items.includes(dragSrcPath)) return;
+      if (dragSrcPaths.includes(fullPath)) return;
 
       div._dropHandled = true;
       container.querySelectorAll('.icon').forEach(el => { el._dropHandled = true; });
@@ -1043,19 +1110,46 @@ async function loadFenceItems() {
       div.classList.remove('insert-after');
     });
 
-    div.addEventListener('dragend', async () => {
+    div.addEventListener('dragend', async (e) => {
       try {
         container.querySelectorAll('.icon.dragging, .icon.drop-target').forEach(el => {
           el.classList.remove('dragging');
           el.classList.remove('drop-target');
         });
+
+        // Capturer l'état AVANT le reset
+        const wentOutside = window.__interFenceDrag === true;
+        const pathsSnapshot = wentOutside ? [...dragSrcPaths] : null;
+
         window.__interFenceDrag = false;
         dragSrcPath = null;
         dragSrcPaths = [];
         div._dropHandled = false;
-        // NE PAS appeler fenceDragCancel ici — dragend sur la source
-        // se déclenche avant (ou pendant) que drop sur la cible s'exécute.
-        // draggedItem sera nettoyé par fenceDragDrop ou par le prochain fenceDragStart.
+
+        // Si le drag est sorti de la fenêtre, vérifier si le placeholder se trouve
+        // sur le bureau : c'est le signal fiable que le drop a eu lieu sur le bureau.
+        // Le placeholder est déplacé par Windows de %TEMP% vers le bureau lors du dépôt.
+        // Ici, on utilise placeholder pour le drag: si le placeholder est sur le bureau,
+        // on déplace les vrais fichiers vers le bureau.
+        if (wentOutside && pathsSnapshot && pathsSnapshot.length) {
+          // Le shell peut déposer le placeholder avec un léger délai; on poll brièvement
+          // pour éviter l'effet "si je bouge la souris ça devient rapide".
+          let droppedOnDesktop = false;
+          for (let i = 0; i < 30; i++) { // ~3s max
+            try {
+              droppedOnDesktop = !!(await window.api.dragDroppedOnDesktop?.());
+            } catch {}
+            if (droppedOnDesktop) break;
+            await new Promise(r => setTimeout(r, 100));
+          }
+
+          if (droppedOnDesktop) {
+            for (const p of pathsSnapshot) {
+              try { await window.api.extractToDesktop(p, true); } catch {}
+            }
+            await loadFenceItems();
+          }
+        }
       } catch (err) {
       }
     });
@@ -1100,6 +1194,7 @@ async function autoResize() {
 let selectionBox = null;
 let selectionRectStart = null;
 let selectionDragging = false;
+let selectionRectBase = null; // sélection existante au début (Ctrl = add)
 
 function rectsIntersect(a, b) {
   return !(a.right < b.left || a.left > b.right || a.bottom < b.top || a.top > b.bottom);
@@ -1109,7 +1204,10 @@ container.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return;
   if (e.target.closest('.icon') || e.target.closest('.ctx') || e.target.closest('#titlebar')) return;
 
-  clearSelection();
+  // Sans Ctrl/Meta: on démarre une nouvelle sélection. Avec Ctrl/Meta: on ajoute à l'existant.
+  const additive = (e.ctrlKey || e.metaKey);
+  selectionRectBase = additive ? new Set(selectedItems) : new Set();
+  if (!additive) clearSelection();
 
   const cRect = container.getBoundingClientRect();
   selectionRectStart = {
@@ -1147,7 +1245,11 @@ window.addEventListener('mousemove', (e) => {
     bottom: cRect.top + top + height - container.scrollTop
   };
 
+  // Repartir de la sélection de base (Ctrl = add)
   selectedItems.clear();
+  if (selectionRectBase) {
+    for (const p of selectionRectBase) selectedItems.add(p);
+  }
   container.querySelectorAll('.icon').forEach(el => {
     const r = el.getBoundingClientRect();
     if (rectsIntersect(boxRect, r)) selectedItems.add(el.dataset.fullPath);
@@ -1159,6 +1261,7 @@ window.addEventListener('mouseup', () => {
   const wasRectDrag = selectionDragging && selectionBox;
   selectionDragging = false;
   selectionRectStart = null;
+  selectionRectBase = null;
   if (selectionBox) {
     selectionBox.remove();
     selectionBox = null;
