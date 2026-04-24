@@ -2239,13 +2239,23 @@ async function getLnkIcon(lnkPath) {
         return { ok: false, reason: "disabled" };
       }
 
-      // Vérifier que le fichier source est bien sur le bureau (pas dans un sous-dossier)
+      // Vérifier que le fichier source est bien sur le bureau (pas dans un sous-dossier).
+      // Sur Windows, le bureau peut être redirigé (OneDrive). `app.getPath("desktop")`
+      // n'est pas toujours le même chemin que celui utilisé par l'explorateur.
       const desktop = app.getPath("desktop");
+      const desktopCandidates = Array.from(new Set([
+        desktop,
+        path.join(os.homedir(), "Desktop"),
+        path.join(os.homedir(), "OneDrive", "Desktop"),
+      ].filter(Boolean).map(p => path.normalize(p))));
       const srcNorm = path.normalize(srcFullPath);
-      const desktopNorm = path.normalize(desktop);
       const srcDir = path.dirname(srcNorm);
 
-      if (srcDir.toLowerCase() !== desktopNorm.toLowerCase()) {
+      const onDesktopRoot = desktopCandidates.some(d => srcDir.toLowerCase() === d.toLowerCase());
+      if (!onDesktopRoot) {
+        try {
+          console.log("[move-original-to-box-folder] not-on-desktop", { srcDir, desktopCandidates, fenceId });
+        } catch {}
         return { ok: false, reason: "not-on-desktop" };
       }
 
@@ -2256,11 +2266,9 @@ async function getLnkIcon(lnkPath) {
 
       // Récupérer le nom de la fence
       const fence = cfg.fences.find(f => f.id === fenceId);
-      if (!fence) {
-        return { ok: false, reason: "fence-not-found" };
-      }
-
-      const fenceName = fence.name || "Fence";
+      // Si la fence n'est pas encore dans la config (race lors de la création),
+      // fallback: créer quand même le dossier avec un nom stable.
+      const fenceName = (fence?.name || "").trim() || `Fence-${String(fenceId || "").slice(0, 8)}` || "Fence";
       // Nettoyer le nom pour éviter les caractères interdits dans un nom de dossier
       const safeName = fenceName.replace(/[<>:"/\\|?*]/g, "_").trim() || "Fence";
       const boxFolder = path.join(desktop, safeName);

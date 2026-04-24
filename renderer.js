@@ -643,7 +643,7 @@ function buildStyleMenu() {
       <label style="justify-content:space-between;align-items:center;display:flex">
         <span>Ranger le bureau</span>
         <label class="ext-toggle-wrap">
-          <input type="checkbox" class="auto-organize-input" />
+          <input type="checkbox" class="ext-toggle-input auto-organize-input" />
           <span class="ext-toggle-track"><span class="ext-toggle-thumb"></span></span>
         </label>
       </label>
