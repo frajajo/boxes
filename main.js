@@ -532,6 +532,8 @@ let draggedItem = null;
 let lastDragPlaceholderBaseName = null; // basename du placeholder startDrag courant (inter-box / bureau)
 let lastDragPlaceholderPath = null; // chemin complet du placeholder (inter-box)
 let _desktopDropPollTimer = null;
+let _lastNativeDragStartAt = 0;
+let _lastDesktopDetectAt = 0;
 
 // ── OLE DropTarget → handlers (inter-box + fichiers externes) ────────────────
 async function movePathsBetweenFences(filePaths, sourceFenceId, targetFenceId) {
@@ -1933,6 +1935,10 @@ async function getLnkIcon(lnkPath) {
       lastDragPlaceholderPath = tmpFile;
       win.webContents.startDrag({ file: tmpFile, icon });
 
+      _lastNativeDragStartAt = Date.now();
+      _lastDesktopDetectAt = 0;
+      try { console.log('[timing] native-drag-start placeholder=', lastDragPlaceholderBaseName); } catch {}
+
       // ── Finalisation bureau côté MAIN (évite throttling renderer) ──────────
       // Problème observé: si l'utilisateur ne bouge pas la souris après le drop,
       // le renderer peut être throttlé et ne pas lancer extractToDesktop tout de suite.
@@ -1958,7 +1964,8 @@ async function getLnkIcon(lnkPath) {
               return;
             }
 
-            console.log('[desktop-drop] placeholder detected after', Date.now() - startedAt, 'ms');
+            const tDetect = Date.now();
+            console.log('[desktop-drop] placeholder detected after', tDetect - startedAt, 'ms');
             clearInterval(_desktopDropPollTimer);
             _desktopDropPollTimer = null;
 
@@ -1972,6 +1979,7 @@ async function getLnkIcon(lnkPath) {
             const srcFence = draggedItem.fenceId;
             draggedItem = null;
 
+            const tMove0 = Date.now();
             for (const fp of toMove) {
               try {
                 const src = path.normalize(fp);
@@ -1980,10 +1988,20 @@ async function getLnkIcon(lnkPath) {
                 await fs.promises.rename(src, dest);
                 shellUtils?.notifyShellCreate?.(dest);
                 shellUtils?.notifyShellDelete?.(src);
+                // Extra refresh pour accélérer l'update visuel sur le Bureau
+                shellUtils?.notifyShellUpdateItem?.(dest);
               } catch {}
             }
+            shellUtils?.notifyShellRefreshDesktop?.(desktop);
+            const tMove1 = Date.now();
+            try {
+              const dtFromDrag = _lastNativeDragStartAt ? (tMove1 - _lastNativeDragStartAt) : -1;
+              console.log('[timing] main desktop finalize moved', toMove.length, 'file(s) in', (tMove1 - tMove0), 'ms', 'since drag start', dtFromDrag, 'ms');
+            } catch {}
+
             if (srcFence && openFences.has(srcFence)) {
               openFences.get(srcFence).webContents.send("fence-refresh");
+              try { console.log('[timing] fence-refresh sent to source fence after', Date.now() - tMove1, 'ms'); } catch {}
             }
           } catch {}
         }, 100);
@@ -2044,6 +2062,13 @@ async function getLnkIcon(lnkPath) {
     for (const name of candidates) {
       const p = path.join(desktop, name);
       if (!fs.existsSync(p)) continue;
+      if (!_lastDesktopDetectAt) {
+        _lastDesktopDetectAt = Date.now();
+        try {
+          const dt = _lastNativeDragStartAt ? (_lastDesktopDetectAt - _lastNativeDragStartAt) : -1;
+          console.log('[timing] drag-dropped-on-desktop detected after', dt, 'ms', 'name=', name);
+        } catch {}
+      }
       shellUtils?.hideFileNow?.(p);
       const tryDelete = (attempts) => {
         fs.promises.unlink(p)
@@ -2149,6 +2174,7 @@ async function getLnkIcon(lnkPath) {
 
   ipcMain.handle("extract-to-desktop", async (_evt, { filePath, move }) => {
     try {
+      const t0 = Date.now();
       const p = path.normalize(filePath);
       if (!isPathInFences(p)) {
         return { ok: false, error: "Chemin non autorisé" };
@@ -2170,6 +2196,11 @@ async function getLnkIcon(lnkPath) {
         }
       }
 
+      try {
+        const t1 = Date.now();
+        const since = _lastNativeDragStartAt ? (t1 - _lastNativeDragStartAt) : -1;
+        console.log('[timing] extract-to-desktop', move ? 'MOVE' : 'COPY', 'took', (t1 - t0), 'ms', 'since drag start', since, 'ms');
+      } catch {}
       return { ok: true, destPath: dest };
     } catch (e) {
       return { ok: false, error: e.message };

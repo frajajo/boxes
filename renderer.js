@@ -1134,6 +1134,7 @@ async function loadFenceItems() {
         if (wentOutside && pathsSnapshot && pathsSnapshot.length) {
           // Le shell peut déposer le placeholder avec un léger délai; on poll brièvement
           // pour éviter l'effet "si je bouge la souris ça devient rapide".
+          const t0 = Date.now();
           let droppedOnDesktop = false;
           for (let i = 0; i < 30; i++) { // ~3s max
             try {
@@ -1142,6 +1143,7 @@ async function loadFenceItems() {
             if (droppedOnDesktop) break;
             await new Promise(r => setTimeout(r, 100));
           }
+          try { console.log('[timing] renderer dragend poll duration', Date.now() - t0, 'ms', 'result=', droppedOnDesktop); } catch {}
 
           if (droppedOnDesktop) {
             for (const p of pathsSnapshot) {
