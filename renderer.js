@@ -396,8 +396,6 @@ function showContextMenu(filePath, x, y) {
     <button data-act="extract-copy">📋 Copier sur le bureau</button>
     <button data-act="extract-move">↗ Déplacer sur le bureau</button>
     ${!multi ? '<button data-act="rename">Renommer</button>' : ''}
-    ${!multi ? '<button data-act="change-icon">🖼️ Changer l\'icône…</button>' : ''}
-    ${!multi ? '<button data-act="reset-icon">↺ Réinitialiser l\'icône</button>' : ''}
     <button data-act="delete">Supprimer</button>
   `;
   document.body.appendChild(menu);
@@ -464,31 +462,6 @@ function showContextMenu(filePath, x, y) {
           await window.api.renameInFence(filePath, newName);
           await loadFenceItems();
         }
-        break;
-      }
-
-      case 'change-icon': {
-        close();
-        try {
-          const filePath2 = await window.api.pickIconFile();
-          if (!filePath2) return;
-          const buffer = await window.api.readFileAsBuffer(filePath2);
-          if (!buffer) return;
-          const result = await window.api.setCustomIcon(filePath, buffer);
-          if (result?.ok) {
-            await loadFenceItems();
-          } else {
-            alert('Impossible d\'enregistrer l\'icône :\n' + (result?.error ?? 'Erreur inconnue'));
-          }
-        } catch (e) {
-          alert('Erreur : ' + e.message);
-        }
-        return;
-      }
-
-      case 'reset-icon': {
-        await window.api.removeCustomIcon(filePath);
-        await loadFenceItems();
         break;
       }
 

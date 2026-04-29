@@ -2871,9 +2871,22 @@ async function getLnkIcon(lnkPath) {
 
     createTray();
 
-    // ── Raccourci global Alt+Espace : afficher/masquer toutes les boxes ──
+    // ── Raccourci global : toggle toutes les boxes ──
     try {
-      globalShortcut.register('Alt+Space', () => {
+      // NOTE: `Alt+Space` peut interférer avec des boîtes de dialogue / actions système
+      // (ex: Cursor) et provoquer un hide/show inattendu des fences.
+      // On passe sur un combo moins conflictuel.
+      globalShortcut.register('Control+Alt+Space', () => {
+        // Garde: si aucune fenêtre Boxes n'est focus, ne pas toggle (évite les surprises).
+        try {
+          const anyOurFocused = [...openFences.values()].some(w => {
+            try { return w && w.isFocused && w.isFocused(); } catch { return false; }
+          });
+          const mgr = getManagerWin();
+          const anyMgrFocused = mgr && mgr.isFocused && mgr.isFocused();
+          if (!anyOurFocused && !anyMgrFocused) return;
+        } catch {}
+
         const wins = [...openFences.values()];
         const anyVisible = wins.some(w => { try { return w.isVisible(); } catch { return false; } });
         for (const win of wins) {
