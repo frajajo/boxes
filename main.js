@@ -2747,18 +2747,53 @@ async function getLnkIcon(lnkPath) {
 
       const trayIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
       tray = new Tray(trayIcon);
-      tray.setToolTip('Boxes — Gestionnaire de boxes');
+      tray.setToolTip('Boxes — afficher/masquer les boxes');
 
-      // Clic gauche → afficher/masquer le manager
+      // Clic gauche → afficher/masquer TOUTES les boxes (plus user-friendly)
       tray.on('click', () => {
         const mgr = getManagerWin();
-        if (!mgr) return;
-        if (mgr.isVisible() && !mgr.isMinimized()) {
-          mgr.hide();
-        } else {
-          mgr.show();
-          mgr.focus();
+        const wins = [...openFences.values()];
+        const anyVisible = wins.some(w => {
+          try { return w && w.isVisible(); } catch { return false; }
+        });
+
+        if (anyVisible) {
+          // Masquer les boxes (on garde le manager en arrière-plan)
+          if (mgr) { try { mgr.hide(); } catch {} }
+          for (const win of wins) { try { win.hide(); } catch {} }
+          return;
         }
+
+        // Montrer les boxes : si elles n'existent plus en mémoire (tout fermé),
+        // on les recrée depuis la config.
+        let fencesInCfg = [];
+        try {
+          const cfg = readConfig();
+          fencesInCfg = cfg.fences || [];
+          if (fencesInCfg.length > 0) {
+            for (const f of fencesInCfg) {
+              if (!openFences.has(f.id)) createFence(f.id, f.name);
+            }
+          }
+        } catch {}
+
+        // Après éventuel createFence(), afficher tout ce qui est ouvert.
+        const wins2 = [...openFences.values()];
+        let first = null;
+        for (const win of wins2) {
+          try {
+            win.show();
+            if (!first) first = win;
+          } catch {}
+        }
+
+        // Si aucune box n'existe dans la config, on retombe sur le manager.
+        if ((!wins2.length) && mgr && (!fencesInCfg || fencesInCfg.length === 0)) {
+          try { mgr.show(); mgr.focus(); } catch {}
+          return;
+        }
+
+        try { first?.focus(); } catch {}
       });
 
       // Clic droit → menu contextuel
