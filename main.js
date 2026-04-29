@@ -2764,8 +2764,7 @@ async function getLnkIcon(lnkPath) {
         });
 
         if (anyVisible) {
-          // Masquer les boxes (on garde le manager en arrière-plan)
-          if (mgr) { try { mgr.hide(); } catch {} }
+          // Masquer les boxes (on NE masque pas le manager pour éviter que "Manager disparaisse")
           for (const win of wins) { try { win.hide(); } catch {} }
           return;
         }
