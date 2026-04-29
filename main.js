@@ -2758,6 +2758,15 @@ async function getLnkIcon(lnkPath) {
       // Clic gauche → afficher/masquer TOUTES les boxes (plus user-friendly)
       tray.on('click', () => {
         const mgr = getManagerWin();
+        // Toujours réafficher le Manager sur clic tray (sinon il peut rester invisible
+        // et l'utilisateur ne sait plus comment relancer les boxes).
+        try {
+          if (mgr && (!mgr.isVisible || !mgr.isVisible())) {
+            mgr.show();
+          }
+          mgr?.focus?.();
+        } catch {}
+
         const wins = [...openFences.values()];
         const anyVisible = wins.some(w => {
           try { return w && w.isVisible(); } catch { return false; }
