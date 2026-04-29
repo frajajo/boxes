@@ -31,7 +31,7 @@ try {
 // Cache disque des icônes (PNG) — rapide + persistant
 // ─────────────────────────────────────────────
 const ICON_DISK_CACHE_DIR = path.join(app.getPath("userData"), "icon-cache");
-const ICON_DISK_CACHE_VERSION = 12; // bump si tu changes la logique de rendu
+const ICON_DISK_CACHE_VERSION = 13; // bump: préserver le ratio lors du recadrage
 const ICON_DISK_MAX_FILES = 3000;  // ajuste selon ton usage
 
 function ensureDirSync(dir) {
@@ -118,6 +118,8 @@ function shellIconToDataURL(iconData, targetSize = 256) {
 
     const dst = createCanvas(targetSize, targetSize);
     const dstCtx = dst.getContext('2d');
+    dstCtx.imageSmoothingEnabled = true;
+    dstCtx.imageSmoothingQuality = 'high';
 
     // Trouver la bounding box du contenu opaque (seuil >100 pour ignorer l'anti-aliasing léger)
     let minX = width, maxX = 0, minY = height, maxY = 0;
@@ -132,17 +134,28 @@ function shellIconToDataURL(iconData, targetSize = 256) {
       }
     }
 
+    // Important: ne JAMAIS étirer vers un carré (ça déforme si la bounding box n'est pas carrée).
+    // On calcule le "src rect" à recadrer éventuellement, puis on met à l'échelle pour rentrer dans targetSize.
+    let srcX = 0, srcY = 0, srcW = width, srcH = height;
     if (maxX >= minX && maxY >= minY) {
       const contentW = maxX - minX + 1;
       const contentH = maxY - minY + 1;
       if (contentW < width * 0.6 || contentH < height * 0.6) {
-        dstCtx.drawImage(src, minX, minY, contentW, contentH, 0, 0, targetSize, targetSize);
-      } else {
-        dstCtx.drawImage(src, 0, 0, targetSize, targetSize);
+        srcX = minX;
+        srcY = minY;
+        srcW = contentW;
+        srcH = contentH;
       }
-    } else {
-      dstCtx.drawImage(src, 0, 0, targetSize, targetSize);
     }
+
+    const scale = targetSize / Math.max(1, Math.max(srcW, srcH)); // preserve aspect ratio
+    const drawW = Math.max(1, Math.round(srcW * scale));
+    const drawH = Math.max(1, Math.round(srcH * scale));
+    const dx = Math.round((targetSize - drawW) / 2);
+    const dy = Math.round((targetSize - drawH) / 2);
+
+    dstCtx.clearRect(0, 0, targetSize, targetSize);
+    dstCtx.drawImage(src, srcX, srcY, srcW, srcH, dx, dy, drawW, drawH);
 
     return dst.toDataURL('image/png');
   } catch { return null; }
@@ -1098,7 +1111,7 @@ ipcMain.handle("set-fence-name", (_evt, { fenceId, newName }) => {
 });
 
 ipcMain.handle("set-fence-icon-size", (_evt, { fenceId, iconSize }) => {
-  const VALID = [32, 48, 128, 256];
+  const VALID = [32, 48, 60, 256];
   const size = VALID.includes(iconSize) ? iconSize : 48;
   const cfg = readConfig();
   const f = cfg.fences.find((x) => x.id === fenceId);
@@ -2468,57 +2481,6 @@ async function getLnkIcon(lnkPath) {
   });
 
   // ─────────────────────────────────────────────
-  // DUPLIQUER UNE FENCE
-  // ─────────────────────────────────────────────
-
-  ipcMain.handle('duplicate-fence', async (_evt, fenceId) => {
-    try {
-      if (!isValidFenceId(fenceId)) throw new Error('Invalid fenceId');
-      const cfg = readConfig();
-      const src = cfg.fences.find(f => f.id === fenceId);
-      if (!src) throw new Error('Fence introuvable');
-
-      const newId = uuidv4();
-      const newName = src.name + ' (copie)';
-
-      // Copier le dossier de fichiers
-      const srcDir = path.join(FENCES_BASE_DIR, fenceId);
-      const dstDir = path.join(FENCES_BASE_DIR, newId);
-      if (fs.existsSync(srcDir)) {
-        await fs.promises.cp(srcDir, dstDir, { recursive: true });
-      } else {
-        fs.mkdirSync(dstDir, { recursive: true });
-      }
-
-      // Créer l'entrée config avec un léger décalage de position
-      const newFence = {
-        ...src,
-        id: newId,
-        name: newName,
-        bounds: {
-          ...src.bounds,
-          x: (src.bounds?.x ?? 100) + 30,
-          y: (src.bounds?.y ?? 100) + 30,
-        }
-      };
-      cfg.fences.push(newFence);
-      writeConfig(cfg);
-
-      // Ouvrir la nouvelle fence
-      createFence(newId, newName);
-
-      return { id: newId, name: newName };
-    } catch (e) {
-      console.error('[duplicate-fence]', e);
-      return null;
-    }
-  });
-
-
-
-
-
-  // ─────────────────────────────────────────────
   // ROLLUP — réduire une box à sa barre de titre
   // ─────────────────────────────────────────────
 
@@ -2664,106 +2626,7 @@ async function getLnkIcon(lnkPath) {
     }
   }
 
-  ipcMain.handle('export-profile', async () => {
-    try {
-      const exportRoot = path.join(
-        app.getPath('desktop'),
-        `Boxes-icons-${formatStamp()}`
-      );
-      const exportIconsDir = path.join(exportRoot, 'custom-icons');
-
-      fs.mkdirSync(exportIconsDir, { recursive: true });
-
-      const cfg = readConfig();
-      const usedIconPaths = new Set();
-
-      for (const fence of (cfg.fences || [])) {
-        const fenceDir = path.join(FENCES_BASE_DIR, fence.id);
-        if (!fs.existsSync(fenceDir)) continue;
-
-        for (const entry of fs.readdirSync(fenceDir, { withFileTypes: true })) {
-          const entryName = entry.name;
-          const stem = path.basename(entryName, path.extname(entryName)).toLowerCase();
-
-          for (const ext of ['.png', '.jpg', '.jpeg', '.webp', '.ico']) {
-            const iconPath = path.join(USER_ICON_DIR, stem + ext);
-            if (fs.existsSync(iconPath)) {
-              usedIconPaths.add(iconPath);
-              break;
-            }
-          }
-        }
-      }
-
-      let count = 0;
-      for (const src of usedIconPaths) {
-        const dst = path.join(exportIconsDir, path.basename(src));
-        fs.copyFileSync(src, dst);
-        count++;
-      }
-
-      return {
-        ok: true,
-        exportPath: exportRoot,
-        count
-      };
-    } catch (e) {
-      console.error('[export-profile]', e);
-      return { ok: false, error: e.message };
-    }
-  });
-
-  ipcMain.handle('import-profile', async () => {
-    try {
-      const result = await dialog.showOpenDialog({
-        title: 'Choisir un dossier d’icônes Boxes',
-        defaultPath: app.getPath('desktop'),
-        properties: ['openDirectory']
-      });
-
-      if (result.canceled || !result.filePaths?.length) {
-        return { ok: false, canceled: true };
-      }
-
-      const selectedDir = result.filePaths[0];
-
-      let srcIconsDir = null;
-
-      // Cas 1 : on a choisi directement le dossier custom-icons
-      if (path.basename(selectedDir).toLowerCase() === 'custom-icons') {
-        srcIconsDir = selectedDir;
-      }
-      // Cas 2 : on a choisi le dossier parent qui contient custom-icons
-      else {
-        const candidate = path.join(selectedDir, 'custom-icons');
-        if (fs.existsSync(candidate)) {
-          srcIconsDir = candidate;
-        }
-      }
-
-      if (!srcIconsDir || !fs.existsSync(srcIconsDir)) {
-        return {
-          ok: false,
-          error: 'Le dossier sélectionné ne contient pas d’icônes importables.'
-        };
-      }
-
-      fs.mkdirSync(USER_ICON_DIR, { recursive: true });
-      const count = copyDirContentsSyncCount(srcIconsDir, USER_ICON_DIR, {
-        allowedExtensions: new Set(['.png', '.jpg', '.jpeg', '.webp', '.ico'])
-      });
-
-      return {
-        ok: true,
-        importedFrom: selectedDir,
-        count,
-        restartRequired: false
-      };
-    } catch (e) {
-      console.error('[import-profile]', e);
-      return { ok: false, error: e.message };
-    }
-  });
+  // export/import d'icônes retiré (buttons supprimés du launcher)
   ipcMain.handle('restart-app', () => {
     try {
       app.relaunch();
@@ -2947,11 +2810,14 @@ async function getLnkIcon(lnkPath) {
       }
     });
 
-    // Premier lancement (aucune box créée) → afficher le Manager obligatoirement.
-    // Sinon (des boxes existent déjà) → se réduire dans le tray automatiquement.
-    const hasFences = (cfg.fences || []).length > 0;
-    if (startHidden || hasFences) {
+    // Règle d'affichage au démarrage :
+    // - si `--hidden` est passé → masquer (mode "démarrage silencieux")
+    // - sinon → afficher le Launcher/Manager tout de suite
+    if (startHidden) {
       managerWin.hide();
+    } else {
+      try { managerWin.show(); } catch {}
+      try { managerWin.focus(); } catch {}
     }
 
     createTray();

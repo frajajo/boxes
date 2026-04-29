@@ -5,7 +5,7 @@ const titleEl = document.querySelector('#titlebar .title');
 
 let currentFenceId = null;
 let currentStyle = { color: '#1e1e1e', opacity: 0.6 };
-let currentIconSize = 48; // px — 32 | 48 | 128 | 256
+let currentIconSize = 48; // px — 32 | 48 | 60 | 256
 let currentShowExtensions = false;
 
 // ── CSS dynamique pour l'état roulé (box réduite à sa barre de titre) ──
@@ -901,7 +901,7 @@ async function loadFenceItems() {
   // Token anti-race: ignorer les chargements d'icônes d'un ancien rendu
   const renderToken = (window.__renderToken = (window.__renderToken ?? 0) + 1);
 
-  const loadIconAsync = async (fullPath, img) => {
+  const loadIconAsync = async (fullPath, img, boxIconSize) => {
     try {
       let dataURL = null;
       const isLnk = /\.lnk$/i.test(fullPath);
@@ -945,7 +945,24 @@ async function loadFenceItems() {
 
       // Si un nouveau rendu a commencé, ignorer
       if (window.__renderToken !== renderToken) return;
-      if (dataURL && img && img.isConnected) img.src = dataURL;
+      if (dataURL && img && img.isConnected) {
+        // Garder la qualité: ne jamais upscale au-delà de la taille source.
+        // Si l'icône native est petite (ex. 32px), on la laisse à sa taille réelle
+        // au lieu de l'étirer en 48/128, ce qui la rend floue/déformée.
+        img.onload = () => {
+          try {
+            const nw = img.naturalWidth || boxIconSize;
+            const nh = img.naturalHeight || boxIconSize;
+            // Conserver le ratio d'origine et ne jamais upscale.
+            const scale = Math.min(1, boxIconSize / Math.max(nw, nh));
+            const renderW = Math.max(1, Math.round(nw * scale));
+            const renderH = Math.max(1, Math.round(nh * scale));
+            img.style.width = renderW + 'px';
+            img.style.height = renderH + 'px';
+          } catch {}
+        };
+        img.src = dataURL;
+      }
     } catch {}
   };
 
@@ -961,7 +978,7 @@ async function loadFenceItems() {
     img.style.height = sz + 'px';
     // Rendu immédiat: on charge l'icône en arrière-plan (sinon la box "freeze" 20-30s)
     img.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNl7BcQAAAABJRU5ErkJggg==';
-    loadIconAsync(fullPath, img);
+    loadIconAsync(fullPath, img, sz);
 
     const label = document.createElement('div');
     label.className = 'name';

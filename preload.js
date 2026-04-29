@@ -34,6 +34,10 @@ const apiCommon = {
   getWindowClassUnderCursor: () => {
     try { return shellUtils?.getWindowClassUnderCursor?.() ?? null; } catch { return null; }
   },
+
+  // Paramètres fence (utiles aussi dans le manager)
+  setFenceIconSize: (fenceId, iconSize) =>
+    ipcRenderer.invoke('set-fence-icon-size', { fenceId, iconSize }),
 };
 
 const apiManager = {
@@ -46,16 +50,11 @@ const apiManager = {
   managerToggleMaximize: () => ipcRenderer.invoke('manager-toggle-maximize'),
   managerClose: () => ipcRenderer.invoke('manager-close'),
   quitApp: () => ipcRenderer.invoke('quit-app'),
-  exportProfile: () => ipcRenderer.invoke('export-profile'),
-  importProfile: () => ipcRenderer.invoke('import-profile'),
   restartApp: () => ipcRenderer.invoke('restart-app'),
 
   // Démarrage automatique avec Windows
   getAutostart: () => ipcRenderer.invoke('get-autostart'),
   setAutostart: (enable) => ipcRenderer.invoke('set-autostart', enable),
-
-  // Dupliquer une fence
-  duplicateFence: (fenceId) => ipcRenderer.invoke('duplicate-fence', fenceId),
 };
 
 const apiFence = {

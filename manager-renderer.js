@@ -195,8 +195,6 @@ console.log('[manager] APIs:', window.api);
 // ─────────────────────────────────────────────
 const createBtn = qs('create-btn');
 const fenceList = qs('fence-list');
-const exportBtn = qs('export-btn');
-const importBtn = qs('import-btn');
 const autostartBtn = qs('wc-autostart');
 const helpOverlay = qs('help-overlay');
 const helpBtn = qs('wc-help');
@@ -310,72 +308,6 @@ if (helpOverlay) {
 }
 
 // ─────────────────────────────────────────────
-// Export / Import des icônes
-// ─────────────────────────────────────────────
-if (exportBtn) {
-  exportBtn.addEventListener('click', async () => {
-    try {
-      if (!hasApi('exportProfile')) {
-        await showAlertDialog('Export impossible', "L'API exportProfile n'est pas disponible.");
-        return;
-      }
-
-      const res = await window.api.exportProfile();
-
-      if (res?.canceled) return;
-
-      if (!res?.ok) {
-        await showAlertDialog('Export impossible', res?.error || 'Erreur inconnue');
-        return;
-      }
-
-      await showAlertDialog(
-        'Export terminé',
-        `${res.count ?? 0} icône(s) exportée(s) dans :\n${res.exportPath}`
-      );
-    } catch (e) {
-      console.error('[manager] export failed', e);
-      await showAlertDialog('Export impossible', e.message || String(e));
-    }
-  });
-}
-
-if (importBtn) {
-  importBtn.addEventListener('click', async () => {
-    try {
-      if (!hasApi('importProfile')) {
-        await showAlertDialog('Import impossible', "L'API importProfile n'est pas disponible.");
-        return;
-      }
-
-      const ok = await showConfirmDialog(
-        'Importer des icônes personnalisées ?\n' +
-        'Les icônes du dossier choisi seront copiées dans le profil courant.',
-        'Importer des icônes'
-      );
-      if (!ok) return;
-
-      const res = await window.api.importProfile();
-
-      if (res?.canceled) return;
-
-      if (!res?.ok) {
-        await showAlertDialog('Import impossible', res?.error || 'Erreur inconnue');
-        return;
-      }
-
-      await showAlertDialog(
-        'Import terminé',
-        `${res.count ?? 0} icône(s) importée(s).`
-      );
-    } catch (e) {
-      console.error('[manager] import failed', e);
-      await showAlertDialog('Import impossible', e.message || String(e));
-    }
-  });
-}
-
-// ─────────────────────────────────────────────
 // Fences
 // ─────────────────────────────────────────────
 async function loadFences() {
@@ -426,27 +358,6 @@ async function loadFences() {
       sizeBtn.title = 'Taille des icônes';
       sizeBtn.textContent = '⊞';
 
-      // Bouton dupliquer
-      const dupBtn = document.createElement('button');
-      dupBtn.className = 'fence-action-btn dup';
-      dupBtn.textContent = '⧉';
-      dupBtn.title = 'Dupliquer cette box';
-
-      dupBtn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        if (!hasApi('duplicateFence')) {
-          await showAlertDialog('Fonction indisponible', "L'API duplicateFence n'est pas disponible.");
-          return;
-        }
-        try {
-          const result = await window.api.duplicateFence(fence.id);
-          if (result) await loadFences();
-          else await showAlertDialog('Erreur', 'La duplication a échoué.');
-        } catch (err) {
-          await showAlertDialog('Erreur', err.message || String(err));
-        }
-      });
-
       sizeBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
 
@@ -460,7 +371,7 @@ async function loadFences() {
         const sizes = [
           { label: '🔲 Petites (32 px)', value: 32 },
           { label: '⬛ Moyennes (48 px)', value: 48 },
-          { label: '🟫 Grandes (128 px)', value: 128 },
+          { label: '🟫 Grandes (60 px)', value: 60 },
         ];
 
         const menu = document.createElement('div');
@@ -530,7 +441,6 @@ async function loadFences() {
       });
 
       actions.appendChild(sizeBtn);
-      actions.appendChild(dupBtn);
       actions.appendChild(deleteBtn);
       item.appendChild(name);
       item.appendChild(actions);
