@@ -31,7 +31,7 @@ try {
 // Cache disque des icônes (PNG) — rapide + persistant
 // ─────────────────────────────────────────────
 const ICON_DISK_CACHE_DIR = path.join(app.getPath("userData"), "icon-cache");
-const ICON_DISK_CACHE_VERSION = 13; // bump: préserver le ratio lors du recadrage
+const ICON_DISK_CACHE_VERSION = 18; // bump: fond par médiane bords (cas icônes opaques)
 const ICON_DISK_MAX_FILES = 3000;  // ajuste selon ton usage
 
 function ensureDirSync(dir) {
@@ -121,11 +121,47 @@ function shellIconToDataURL(iconData, targetSize = 256) {
     dstCtx.imageSmoothingEnabled = true;
     dstCtx.imageSmoothingQuality = 'high';
 
-    // Trouver la bounding box du contenu opaque (seuil >100 pour ignorer l'anti-aliasing léger)
+    // Trouver la bounding box du contenu — méthode robuste:
+    // certaines icônes Windows ont un alpha "bruité" ou des RGB non nuls dans les zones supposées transparentes.
+    // On estime une couleur de fond (bords) puis on détecte le "contenu" par distance au fond + alpha.
+    const clamp255 = (n) => Math.max(0, Math.min(255, n | 0));
+    const distL1 = (r1, g1, b1, r2, g2, b2) => Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
+
+    // Estimer le fond via la médiane des pixels de bord.
+    // (Certaines icônes ont alpha opaque partout => pas de "transparent" utilisable.)
+    const step = Math.max(1, Math.floor(Math.min(width, height) / 24)); // ~24 échantillons / bord
+    const br = [], bg = [], bb = [];
+    const sample = (x, y) => {
+      const i = (y * width + x) * 4;
+      br.push(data[i + 0]);
+      bg.push(data[i + 1]);
+      bb.push(data[i + 2]);
+    };
+    for (let x = 0; x < width; x += step) { sample(x, 0); sample(x, height - 1); }
+    for (let y = 0; y < height; y += step) { sample(0, y); sample(width - 1, y); }
+    const median = (arr) => {
+      if (!arr.length) return 0;
+      const a = arr.slice().sort((x, y) => x - y);
+      return a[(a.length / 2) | 0] | 0;
+    };
+    const bgR = median(br);
+    const bgG = median(bg);
+    const bgB = median(bb);
+
     let minX = width, maxX = 0, minY = height, maxY = 0;
+    let inkCount = 0;
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        if (data[(y * width + x) * 4 + 3] > 100) {
+        const i = (y * width + x) * 4;
+        const r = data[i + 0], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+        const d = distL1(r, g, b, bgR, bgG, bgB);
+        // "encre" si suffisamment différent du fond.
+        // - alpha fort: tolère plus proche du fond (anti-alias)
+        // - alpha moyen: exige plus de contraste
+        // Seuil un peu plus élevé car le fond médian est souvent fiable.
+        const hasInk = (a >= 96 && d >= 22) || (a >= 32 && d >= 48) || (d >= 110);
+        if (hasInk) {
+          inkCount++;
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
@@ -134,18 +170,80 @@ function shellIconToDataURL(iconData, targetSize = 256) {
       }
     }
 
+    // Fallback alpha-only si la détection "fond" a échoué (aucune encre trouvée)
+    if (inkCount === 0) {
+      minX = width; maxX = 0; minY = height; maxY = 0;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const a = data[(y * width + x) * 4 + 3];
+          if (a >= 24) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+    }
+
+    // Essai bbox alpha-only plus stricte (utile pour certains raccourcis/apps:
+    // même si la bbox "fond+alpha" n'est pas full, elle peut englober trop de marge et l'icône paraît petite).
+    try {
+      const curW = (maxX >= minX) ? (maxX - minX + 1) : 0;
+      const curH = (maxY >= minY) ? (maxY - minY + 1) : 0;
+
+      const tryAlphaBBox = (thr) => {
+        let aMinX = width, aMaxX = 0, aMinY = height, aMaxY = 0, cnt = 0;
+        for (let yy = 0; yy < height; yy++) {
+          for (let xx = 0; xx < width; xx++) {
+            const a = data[(yy * width + xx) * 4 + 3];
+            if (a >= thr) {
+              cnt++;
+              if (xx < aMinX) aMinX = xx;
+              if (xx > aMaxX) aMaxX = xx;
+              if (yy < aMinY) aMinY = yy;
+              if (yy > aMaxY) aMaxY = yy;
+            }
+          }
+        }
+        if (cnt === 0 || aMaxX < aMinX || aMaxY < aMinY) return null;
+        const w2 = aMaxX - aMinX + 1;
+        const h2 = aMaxY - aMinY + 1;
+        const full2 = (w2 >= width * 0.92) && (h2 >= height * 0.92);
+        return full2 ? null : { minX: aMinX, maxX: aMaxX, minY: aMinY, maxY: aMaxY, w: w2, h: h2 };
+      };
+
+      const tighter =
+        tryAlphaBBox(224) ||
+        tryAlphaBBox(192) ||
+        tryAlphaBBox(160) ||
+        tryAlphaBBox(128);
+
+      // On adopte la bbox alpha-only si elle est sensiblement plus "serrée"
+      // (sinon on garde la bbox existante, qui marche pour la majorité des icônes).
+      if (tighter && curW > 0 && curH > 0) {
+        const tighterIsSmaller = tighter.w <= curW * 0.88 && tighter.h <= curH * 0.88;
+        if (tighterIsSmaller) {
+          minX = tighter.minX; maxX = tighter.maxX;
+          minY = tighter.minY; maxY = tighter.maxY;
+        }
+      }
+    } catch {}
+
     // Important: ne JAMAIS étirer vers un carré (ça déforme si la bounding box n'est pas carrée).
     // On calcule le "src rect" à recadrer éventuellement, puis on met à l'échelle pour rentrer dans targetSize.
     let srcX = 0, srcY = 0, srcW = width, srcH = height;
     if (maxX >= minX && maxY >= minY) {
-      const contentW = maxX - minX + 1;
-      const contentH = maxY - minY + 1;
-      if (contentW < width * 0.6 || contentH < height * 0.6) {
-        srcX = minX;
-        srcY = minY;
-        srcW = contentW;
-        srcH = contentH;
-      }
+      // Padding pour éviter de couper un glow / badge
+      const pad = 3;
+      minX = Math.max(0, minX - pad);
+      minY = Math.max(0, minY - pad);
+      maxX = Math.min(width - 1, maxX + pad);
+      maxY = Math.min(height - 1, maxY + pad);
+      srcX = minX;
+      srcY = minY;
+      srcW = maxX - minX + 1;
+      srcH = maxY - minY + 1;
     }
 
     const scale = targetSize / Math.max(1, Math.max(srcW, srcH)); // preserve aspect ratio
