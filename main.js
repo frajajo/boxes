@@ -867,7 +867,13 @@ function createFence(fenceId, fenceName) {
   });
 
   win.loadFile("fence.html");
-  win.once("ready-to-show", () => { try { win.setIcon(APP_ICON); } catch {} });
+  // Forcer l'affichage dès que la fenêtre est prête.
+  // (Sur certaines conditions “packaged / shortcut”, les fenêtres transparentes
+  // peuvent rester invisibles sinon.)
+  win.once("ready-to-show", () => {
+    try { win.setIcon(APP_ICON); } catch {}
+    try { win.show(); } catch {}
+  });
   win.webContents.once('did-finish-load', () => {
     if (isRolledOnStart) {
       win.webContents.send('rolled-state-changed', true);
@@ -2871,6 +2877,19 @@ async function getLnkIcon(lnkPath) {
     }
 
     for (const f of cfg.fences || []) createFence(f.id, f.name);
+    // Sécurité: si on lance en mode “hidden” (manager en tray) et qu'aucune
+    // box n'est visible, forcer l'affichage de toutes les fenêtres.
+    try {
+      if (startHidden) {
+        const wins = [...openFences.values()];
+        const anyVisible = wins.some(w => {
+          try { return w && w.isVisible && w.isVisible(); } catch { return false; }
+        });
+        if (!anyVisible) {
+          for (const win of wins) { try { win.show(); } catch {} }
+        }
+      }
+    } catch {}
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createManager();
