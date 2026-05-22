@@ -2,6 +2,17 @@
 
 const container = document.getElementById('container');
 const titleEl = document.querySelector('#titlebar .title');
+// Expérimentation "Stardock-like" : drag OLE prioritaire.
+// Mettre à false pour revenir immédiatement au mode stable placeholder.
+const USE_STARDOCK_OLE_EXPERIMENT = false;
+const TRANSPARENT_DRAG_IMG = (() => {
+  // Canvas 1x1 transparent prêt immédiatement (contrairement à Image qui peut
+  // ne pas être décodée à temps pendant dragstart).
+  const c = document.createElement('canvas');
+  c.width = 1;
+  c.height = 1;
+  return c;
+})();
 
 let currentFenceId = null;
 let currentStyle = { color: '#1e1e1e', opacity: 0.6 };
@@ -100,6 +111,9 @@ let _refreshTimer = null;
     // Rafraîchir si une autre fence a déplacé un fichier ici (debounce pour éviter flash)
     window.api.onFenceRefresh(() => {
       clearTimeout(_refreshTimer);
+      // Bypass du retry "transitoire" : fence-refresh signifie que le main process
+      // a confirmé un changement réel — l'état vide n'est pas transitoire.
+      _lastNonEmptyAt = 0;
       _refreshTimer = setTimeout(() => { loadFenceItems(); }, 120);
     });
 
@@ -228,7 +242,7 @@ container.addEventListener('dragover', e => {
   } else {
     container.classList.add('drop-hint');
     container.classList.remove('drop-inter');
-    e.dataTransfer.dropEffect = 'copy';
+    e.dataTransfer.dropEffect = 'move';
   }
 });
 
@@ -248,27 +262,47 @@ container.addEventListener('drop', async (e) => {
   container.classList.remove('drop-inter');
   if (!currentFenceId) return;
 
-  // Lire files AVANT tout await — dataTransfer est vidé dès qu'on perd la main
+  // Lire TOUT le dataTransfer AVANT tout await — il est vidé dès qu'on perd la main
   const files = Array.from(e.dataTransfer?.files ?? []);
+  // Détection synchrone du drag inter-box via les données HTML5 (fiable quand startDrag
+  // n'a pas remplacé le drag par un drag OLE natif).
+  let isHtmlInterFenceDrag = false;
   try {
-    console.log('[container drop] fence', currentFenceId, 'files:', files.map(f => (f?.path || f?.name || '')));
+    isHtmlInterFenceDrag = !!(e.dataTransfer.getData('application/x-boxes-internal'));
   } catch {}
 
-  // Le drag inter-box est géré en OLE au niveau natif (drop target) :
-  // ici, on ne traite que les drops externes HTML5 (explorateur/navigateur) sur le container.
+  try {
+    console.log('[container drop] fence', currentFenceId, 'files:', files.map(f => (f?.path || f?.name || '')), 'htmlInter=', isHtmlInterFenceDrag);
+  } catch {}
 
   // Inter-box via placeholder startDrag: Windows dépose un fichier temp `boxes-drag-*.tmp`
   // dans `dataTransfer.files`. Dans ce cas, on demande au main de finaliser le move.
   try {
-    const maybeInter = await window.api.isInterFenceDrag?.();
+    const isPlaceholderName = (name) =>
+      /^boxes-drag-.*\.tmp$/i.test(name) || name.toLowerCase() === 'boxes-drag-placeholder.tmp';
     const hasTmp = files.some(f => {
       const name = (f?.path || f?.name || '').split(/[\\/]/).pop() || '';
-      return /^boxes-drag-.*\.tmp$/i.test(name) || name.toLowerCase() === 'boxes-drag-placeholder.tmp';
+      return isPlaceholderName(name);
     });
-    try { console.log('[container drop] maybeInter=', maybeInter, 'hasTmp=', hasTmp); } catch {}
-    if (maybeInter || hasTmp) {
+    const fenceFilePaths = files
+      .map(f => (f?.path || '').trim())
+      .filter(p => p && !isPlaceholderName(p.split(/[\\/]/).pop() || ''));
+
+    if (fenceFilePaths.length > 0 && await window.api.isInterFenceDrag?.()) {
+      const moved = await window.api.fenceDragDropPaths?.(currentFenceId, fenceFilePaths);
+      if (moved) {
+        window.__interFenceDropHandled = true;
+        await loadFenceItems();
+        return;
+      }
+    }
+
+    const maybeInter = isHtmlInterFenceDrag || hasTmp || !!(await window.api.isInterFenceDrag?.());
+    try { console.log('[container drop] maybeInter=', maybeInter, 'hasTmp=', hasTmp, 'htmlInter=', isHtmlInterFenceDrag); } catch {}
+    if (maybeInter) {
+      window.__interFenceDropHandled = true;
       await window.api.fenceDragDrop?.(currentFenceId);
-      await window.api.cleanupDragPlaceholder?.();
+      try { window.api.shellDragEnded?.(); } catch {}
       await loadFenceItems();
       return;
     }
@@ -280,8 +314,7 @@ container.addEventListener('drop', async (e) => {
       try {
         if (f.path && f.path.trim() !== '') {
           const realName = f.path.split(/[\\/]/).pop() || f.name;
-          await window.api.copyToFence(currentFenceId, f.path, realName);
-          await window.api.moveOriginalToBoxFolder(f.path, currentFenceId);
+          await window.api.moveToFence(currentFenceId, f.path, realName);
         } else {
           const buffer = await f.arrayBuffer();
           await window.api.writeBufferToFence(currentFenceId, f.name, buffer);
@@ -751,8 +784,11 @@ function buildSortMenu() {
     const isOpening = menu.style.display === 'none';
     menu.style.display = isOpening ? 'flex' : 'none';
     if (isOpening) {
-      // Agrandir la fenêtre pour que le menu soit entièrement visible
-      window.api.setContentHeight(r.bottom + 4 + menu.offsetHeight + 8);
+      // Agrandir la fenêtre UNIQUEMENT si le menu dépasse la hauteur actuelle
+      const needed = r.bottom + 4 + menu.offsetHeight + 8;
+      if (needed > window.innerHeight) {
+        window.api.setContentHeight(needed);
+      }
     } else {
       autoResize();
     }
@@ -956,6 +992,9 @@ async function loadFenceItems() {
         if (e.dataTransfer) {
           e.dataTransfer.effectAllowed = 'move';
           e.dataTransfer.setData('text/plain', fullPath);
+          // Masquer le feedback HTML5 Chromium (badge "interdit" visuel).
+          // Le déplacement réel reste géré par la logique native/placeholder.
+          try { e.dataTransfer.setDragImage(TRANSPARENT_DRAG_IMG, 0, 0); } catch {}
         }
 
         window.__interFenceDrag = true;
@@ -994,29 +1033,26 @@ async function loadFenceItems() {
           } catch {}
         }
 
-        // Choisir stratégie:
-        // - Bureau/Explorer: OLE depuis preload (instantané)
-        // - Autre box: placeholder via main (inter-box)
-        const cls = window.api.getWindowClassUnderCursor?.();
-        const isExplorerOrDesktop =
-          typeof cls === 'string' && (
-            cls === 'CabinetWClass' ||
-            cls === 'ExploreWClass' ||
-            cls === 'WorkerW' ||
-            cls === 'Progman' ||
-            cls === 'SHELLDLL_DefView' ||
-            cls === 'SysListView32' ||
-            cls === 'DirectUIHWND'
-          );
+        window.__interFenceDropHandled = false;
+        window.__oleDragSession = false;
 
-        if (isExplorerOrDesktop) {
-          // Empêcher le drag HTML5 de Chromium et lancer un vrai drag système.
-          try { e.preventDefault(); } catch {}
-          setTimeout(() => {
-            window.api.startOleDrag?.(pathsSnapshot, currentFenceId).catch(() => {});
+        if (USE_STARDOCK_OLE_EXPERIMENT && window.api.hasNativeFileDrag?.()) {
+          window.__oleDragSession = true;
+          setTimeout(async () => {
+            let effect = 0;
+            try {
+              effect = await window.api.startOleDrag?.(pathsSnapshot, currentFenceId);
+            } catch {}
+            // Fallback instantané vers la version stable si OLE n'a pas démarré.
+            if (!effect) {
+              window.__oleDragSession = false;
+              try { window.api.nativeDragStart(pathsSnapshot, currentFenceId); } catch {}
+            }
           }, 0);
         } else {
-          window.api.nativeDragStart(pathsSnapshot, currentFenceId).catch(() => {});
+          // Chemin stable placeholder (version de secours)
+          window.__oleDragSession = false;
+          try { window.api.nativeDragStart(pathsSnapshot, currentFenceId); } catch {}
         }
       } catch {}
     });
@@ -1109,25 +1145,56 @@ async function loadFenceItems() {
         // Le placeholder est déplacé par Windows de %TEMP% vers le bureau lors du dépôt.
         // Ici, on utilise placeholder pour le drag: si le placeholder est sur le bureau,
         // on déplace les vrais fichiers vers le bureau.
-        if (wentOutside && pathsSnapshot && pathsSnapshot.length) {
-          // Le shell peut déposer le placeholder avec un léger délai; on poll brièvement
-          // pour éviter l'effet "si je bouge la souris ça devient rapide".
-          const t0 = Date.now();
-          let droppedOnDesktop = false;
-          for (let i = 0; i < 30; i++) { // ~3s max
-            try {
-              droppedOnDesktop = !!(await window.api.dragDroppedOnDesktop?.());
-            } catch {}
-            if (droppedOnDesktop) break;
-            await new Promise(r => setTimeout(r, 100));
-          }
-          try { console.log('[timing] renderer dragend poll duration', Date.now() - t0, 'ms', 'result=', droppedOnDesktop); } catch {}
+        if (window.__oleDragSession) {
+          window.__oleDragSession = false;
+          return;
+        }
 
-          if (droppedOnDesktop) {
-            for (const p of pathsSnapshot) {
-              try { await window.api.extractToDesktop(p, true); } catch {}
+        if (wentOutside && pathsSnapshot && pathsSnapshot.length) {
+          if (window.__interFenceDropHandled) {
+            window.__interFenceDropHandled = false;
+            return;
+          }
+
+          // Contournement bureau : si le curseur est sur le bureau au relâchement,
+          // déplacer directement les fichiers vers Desktop.
+          // (évite le blocage "sens interdit" de certains environnements Windows)
+          try {
+            const cls = window.api.getWindowClassUnderCursor?.();
+            const onDesktop =
+              typeof cls === 'string' && (
+                cls === 'WorkerW' ||
+                cls === 'Progman' ||
+                cls === 'SHELLDLL_DefView' ||
+                cls === 'SysListView32' ||
+                cls === 'DirectUIHWND'
+              );
+            if (onDesktop) {
+              for (const p of pathsSnapshot) {
+                try { await window.api.extractToDesktop?.(p, true); } catch {}
+              }
+              _lastNonEmptyAt = 0;
+              await loadFenceItems();
+              return;
             }
+          } catch {}
+
+          let handled = false;
+          for (let i = 0; i < 35; i++) {
+            await new Promise(r => setTimeout(r, 100));
+            try {
+              const res = await window.api.finalizeDesktopDrop?.();
+              if (res?.handled) {
+                handled = true;
+                break;
+              }
+            } catch {}
+          }
+          if (handled) {
+            _lastNonEmptyAt = 0;
             await loadFenceItems();
+          } else {
+            try { window.api.shellDragEnded?.(); } catch {}
           }
         }
       } catch (err) {
@@ -1162,7 +1229,10 @@ async function loadFenceItems() {
 
 async function autoResize() {
   if (document.body.classList.contains('rolled')) return;
+  if (document.body.classList.contains('du-modal-open') || document.querySelector('.du-overlay')) return;
   await new Promise(r => requestAnimationFrame(r));
+  // Re-vérifier après le délai : un dialog a pu s'ouvrir entre les deux
+  if (document.body.classList.contains('du-modal-open') || document.querySelector('.du-overlay')) return;
   const titlebarEl = document.getElementById('titlebar');
   const h = titlebarEl.offsetHeight + container.scrollHeight + 2; // +2 bordures container
   window.api.setContentHeight(h);

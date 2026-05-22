@@ -504,3 +504,7 @@ if (createBtn) {
 loadFences().catch(err => {
   console.error('[manager] loadFences fatal', err);
 });
+
+if (window.api?.onManagerRefresh) {
+  window.api.onManagerRefresh(() => loadFences().catch(() => {}));
+}

@@ -639,18 +639,214 @@ const FENCE_MIN_W = 160;  // largeur minimale d'une fence
 
 // États
 const openFences = new Map();
+let managerWin = null;
 let draggedItem = null;
 let lastDragPlaceholderBaseName = null; // basename du placeholder startDrag courant (inter-box / bureau)
 let lastDragPlaceholderPath = null; // chemin complet du placeholder (inter-box)
 let _desktopDropPollTimer = null;
 let _lastNativeDragStartAt = 0;
 let _lastDesktopDetectAt = 0;
+let _shellDragActive = false;
+let _shellDragEndTimer = null;
+let _lastInterFenceDropKey = '';
+let _lastInterFenceDropAt = 0;
+let _desktopDropFinalized = false;
+let _desktopDropFinalizing = false;
+
+function shouldSkipDuplicateInterFenceDrop(sourceFenceId, targetFenceId, paths) {
+  const key = `${sourceFenceId || ''}->${targetFenceId || ''}:${(paths || []).join('|')}`;
+  const now = Date.now();
+  if (key === _lastInterFenceDropKey && now - _lastInterFenceDropAt < 900) return true;
+  _lastInterFenceDropKey = key;
+  _lastInterFenceDropAt = now;
+  return false;
+}
+
+function isDragPlaceholderBasename(name) {
+  if (typeof name !== 'string' || !name) return false;
+  const lower = name.toLowerCase();
+  return lower === 'boxes-drag-placeholder.tmp' || /^boxes-drag-.*\.tmp$/i.test(name);
+}
+
+function isDragPlaceholderPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return false;
+  return isDragPlaceholderBasename(path.basename(filePath));
+}
+
+function markShellDragActive() {
+  _shellDragActive = true;
+  if (_shellDragEndTimer) {
+    clearTimeout(_shellDragEndTimer);
+    _shellDragEndTimer = null;
+  }
+}
+
+function scheduleShellDragInactive(delayMs = 800) {
+  if (_shellDragEndTimer) clearTimeout(_shellDragEndTimer);
+  _shellDragEndTimer = setTimeout(() => {
+    _shellDragActive = false;
+    _shellDragEndTimer = null;
+  }, delayMs);
+}
+
+/**
+ * Placeholders boxes-drag-*.tmp sur le bureau bloquent les drops natifs.
+ * Ne jamais supprimer un placeholder encore utilisé par un drag Windows (crash).
+ */
+function cleanupResidualDragPlaceholdersOnDesktop(extraNames = [], opts = {}) {
+  if (process.platform !== 'win32') return false;
+  const {
+    deferMs = 0,
+    scanDesktop = true,
+    minAgeMs = 2500,
+  } = opts;
+
+  const run = async () => {
+    if (_shellDragActive) return;
+    try {
+      const desktop = app.getPath('desktop');
+      const explicit = new Set(
+        (Array.isArray(extraNames) ? extraNames : [extraNames]).filter(Boolean)
+      );
+      const toDelete = new Set();
+
+      for (const name of explicit) {
+        if (isDragPlaceholderBasename(name)) toDelete.add(name);
+      }
+
+      if (scanDesktop) {
+        let entries = [];
+        try { entries = await fs.promises.readdir(desktop); } catch {}
+        if (_shellDragActive) return;
+        for (const entry of entries) {
+          if (!isDragPlaceholderBasename(entry)) continue;
+          if (explicit.has(entry)) {
+            toDelete.add(entry);
+            continue;
+          }
+          const p = path.join(desktop, entry);
+          try {
+            const stat = await fs.promises.stat(p);
+            if (Date.now() - stat.mtimeMs < minAgeMs) continue;
+          } catch { continue; }
+          toDelete.add(entry);
+        }
+      }
+
+      if (_shellDragActive) return;
+      for (const name of toDelete) {
+        const p = path.join(desktop, name);
+        try {
+          await fs.promises.unlink(p);
+          shellUtils?.notifyShellDelete?.(p);
+        } catch {}
+      }
+    } catch {}
+  };
+
+  if (deferMs > 0) {
+    setTimeout(() => run().catch(() => {}), deferMs);
+    return false;
+  }
+  run().catch(() => {});
+  return false;
+}
+
+function scheduleDeferredDesktopPlaceholderCleanup(extraNames = []) {
+  scheduleShellDragInactive(700);
+  cleanupResidualDragPlaceholdersOnDesktop(extraNames, { deferMs: 700, scanDesktop: false });
+  setTimeout(() => {
+    if (!_shellDragActive) {
+      cleanupResidualDragPlaceholdersOnDesktop([], { scanDesktop: true, minAgeMs: 2500 });
+    }
+  }, 1500);
+}
+
+/** Finalise un drop bureau (une seule fois — évite double rename / crash au relâchement). */
+async function finalizeDesktopDropIfNeeded() {
+  if (_desktopDropFinalized) return { handled: true };
+  if (_desktopDropFinalizing) {
+    for (let i = 0; i < 25; i++) {
+      await new Promise(r => setTimeout(r, 40));
+      if (_desktopDropFinalized) return { handled: true };
+      if (!_desktopDropFinalizing) break;
+    }
+    if (_desktopDropFinalized) return { handled: true };
+  }
+  if (!draggedItem || !Array.isArray(draggedItem.filePaths) || draggedItem.filePaths.length === 0) {
+    return { handled: false };
+  }
+
+  const desktop = app.getPath('desktop');
+  const placeholderNames = [
+    lastDragPlaceholderBaseName,
+    'boxes-drag-placeholder.tmp',
+  ].filter(Boolean);
+
+  let placeholderOnDesktop = null;
+  for (const name of placeholderNames) {
+    const p = path.join(desktop, name);
+    if (fs.existsSync(p)) {
+      placeholderOnDesktop = p;
+      break;
+    }
+  }
+  if (!placeholderOnDesktop) {
+    return { handled: false };
+  }
+
+  _desktopDropFinalizing = true;
+  try {
+    if (_desktopDropPollTimer) {
+      clearInterval(_desktopDropPollTimer);
+      _desktopDropPollTimer = null;
+    }
+
+    const toMove = [...draggedItem.filePaths];
+    const srcFence = draggedItem.fenceId;
+    draggedItem = null;
+    _desktopDropFinalized = true;
+
+    // Retirer le placeholder (pas d'appels shell natifs ici — crash fréquent au relâchement)
+    setTimeout(() => {
+      try { if (fs.existsSync(placeholderOnDesktop)) fs.unlinkSync(placeholderOnDesktop); } catch {}
+    }, 400);
+
+    const tmpPlaceholder = lastDragPlaceholderPath;
+    lastDragPlaceholderPath = null;
+    lastDragPlaceholderBaseName = null;
+    try {
+      if (tmpPlaceholder && fs.existsSync(tmpPlaceholder)) fs.unlinkSync(tmpPlaceholder);
+    } catch {}
+
+    let moved = 0;
+    for (const fp of toMove) {
+      try {
+        const src = path.normalize(fp);
+        if (!fs.existsSync(src) || !isPathInFences(src)) continue;
+        const dest = ensureUniqueDest(path.join(desktop, path.basename(src)));
+        await fs.promises.rename(src, dest);
+        moved++;
+      } catch {}
+    }
+    if (srcFence && openFences.has(srcFence)) {
+      openFences.get(srcFence).webContents.send('fence-refresh');
+    }
+
+    scheduleShellDragInactive(400);
+    scheduleDeferredDesktopPlaceholderCleanup(placeholderNames);
+    return { handled: moved > 0 };
+  } finally {
+    _desktopDropFinalizing = false;
+  }
+}
 
 // ── OLE DropTarget → handlers (inter-box + fichiers externes) ────────────────
 async function movePathsBetweenFences(filePaths, sourceFenceId, targetFenceId) {
   if (!Array.isArray(filePaths) || !filePaths.length) return false;
   if (!isValidFenceId(sourceFenceId) || !isValidFenceId(targetFenceId)) return false;
   if (sourceFenceId === targetFenceId) return false;
+  if (shouldSkipDuplicateInterFenceDrop(sourceFenceId, targetFenceId, filePaths)) return false;
 
   const targetDir = path.join(FENCES_BASE_DIR, targetFenceId);
   fs.mkdirSync(targetDir, { recursive: true });
@@ -669,6 +865,7 @@ async function movePathsBetweenFences(filePaths, sourceFenceId, targetFenceId) {
 
   if (openFences.has(sourceFenceId)) openFences.get(sourceFenceId).webContents.send("fence-refresh");
   if (openFences.has(targetFenceId)) openFences.get(targetFenceId).webContents.send("fence-refresh");
+  scheduleDeferredDesktopPlaceholderCleanup();
   return moved > 0;
 }
 
@@ -719,7 +916,8 @@ function attachOleDropTargetToFenceWindow(win, fenceId) {
           return;
         }
         if (payload.kind === "files" && Array.isArray(payload.files)) {
-          await copyExternalPathsToFence(payload.files, fenceId);
+          const realFiles = payload.files.filter((fp) => !isDragPlaceholderPath(fp));
+          if (realFiles.length) await copyExternalPathsToFence(realFiles, fenceId);
         }
       } catch {}
     });
@@ -879,7 +1077,6 @@ function createFence(fenceId, fenceName) {
     },
   });
 
-  // Activer le drop OLE sur cette box (inter-box + drop Explorer)
   attachOleDropTargetToFenceWindow(win, fenceId);
 
   // Sécurité navigation : aucune ouverture/navigations externes depuis le renderer.
@@ -1209,6 +1406,8 @@ ipcMain.handle("set-fence-name", (_evt, { fenceId, newName }) => {
     f.name = name;
     writeConfig(cfg);
     if (openFences.has(fenceId)) openFences.get(fenceId).setTitle(name);
+    if (managerWin && !managerWin.isDestroyed())
+      managerWin.webContents.send('manager-refresh');
   }
 
   return name;
@@ -1334,6 +1533,45 @@ ipcMain.handle("copy-to-fence", async (_evt, { fenceId, srcFullPath, destName })
     return destPath;
   } catch (e) {
     console.error("[copy-to-fence] failed", e);
+    throw e;
+  }
+});
+
+ipcMain.handle("move-to-fence", async (_evt, { fenceId, srcFullPath, destName }) => {
+  try {
+    if (!isValidFenceId(fenceId)) throw new Error("Invalid fenceId");
+    const safeName = sanitizeFileName(destName);
+    const srcNorm = path.normalize(srcFullPath);
+
+    const dir = path.join(FENCES_BASE_DIR, fenceId);
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Si le fichier source est déjà dans cette fence, ne rien faire
+    const dirNorm = path.normalize(dir);
+    if (srcNorm.startsWith(dirNorm + path.sep)) return srcFullPath;
+
+    const destPath = ensureUniqueDest(path.join(dir, safeName));
+
+    // Priorité : rename atomique (même disque, le plus rapide)
+    try {
+      await fs.promises.rename(srcNorm, destPath);
+      return destPath;
+    } catch (e) {
+      if (e.code !== 'EXDEV') throw e; // Cross-drive uniquement : continuer
+    }
+
+    // Fallback cross-drive : copy + delete
+    const st = fs.lstatSync(srcNorm);
+    if (st.isDirectory()) {
+      await fs.promises.cp(srcNorm, destPath, { recursive: true });
+      await fs.promises.rm(srcNorm, { recursive: true, force: true });
+    } else {
+      try { await fs.promises.copyFile(srcNorm, destPath); } catch { await streamCopy(srcNorm, destPath); }
+      await fs.promises.unlink(srcNorm);
+    }
+    return destPath;
+  } catch (e) {
+    console.error("[move-to-fence] failed", e);
     throw e;
   }
 });
@@ -1988,6 +2226,8 @@ async function getLnkIcon(lnkPath) {
   ipcMain.handle("fence-drag-start", (_evt, { filePath, filePaths, fenceId }) => {
     // Accepte un seul fichier (filePath) ou plusieurs (filePaths)
     const paths = filePaths ?? (filePath ? [filePath] : []);
+    _desktopDropFinalized = false;
+    _desktopDropFinalizing = false;
     draggedItem = { filePaths: paths, fenceId };
     // Sécurité : expiration automatique après 10s si aucun drop ne se produit
     if (draggedItem._expireTimer) clearTimeout(draggedItem._expireTimer);
@@ -1996,7 +2236,7 @@ async function getLnkIcon(lnkPath) {
   });
 
   // Drag natif : permet de déposer un fichier depuis une box vers le bureau ou l'explorateur
-  ipcMain.handle("native-drag-start", async (evt, payload) => {
+  const startNativeDragWithPlaceholder = (evt, payload) => {
     try {
       const { filePaths, fenceId } = (payload && typeof payload === 'object') ? payload : { filePaths: payload, fenceId: null };
       // Accepte un chemin unique (string) ou un tableau
@@ -2028,18 +2268,8 @@ async function getLnkIcon(lnkPath) {
       // ou si on est au-dessus d'une autre box (drag inter-box).
       if (winClass) { try { console.log('[native-drag-start] placeholder; winClass=', winClass); } catch {} }
       const firstNorm = path.normalize(validPaths[0]);
-      let icon;
-      try {
-        icon = await app.getFileIcon(firstNorm, { size: 'small' });
-        if (!icon || icon.isEmpty()) icon = null;
-      } catch { icon = null; }
-      if (!icon) {
-        icon = nativeImage.createFromBuffer(Buffer.from(
-          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNl7BcQAAAABJRU5ErkJggg==",
-          "base64"
-        ));
-      }
       if (win.isDestroyed() || win.webContents.isDestroyed()) return false;
+
       // ⚠️ Certains environnements bloquent la création d'un nom fixe dans %TEMP% (EPERM).
       // Utiliser un nom unique à chaque drag évite les conflits/locks/policies.
       const tmpFile = path.join(
@@ -2047,156 +2277,133 @@ async function getLnkIcon(lnkPath) {
         `boxes-drag-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.tmp`
       );
       fs.writeFileSync(tmpFile, '');
-      await markFileHiddenSystemBestEffort(tmpFile);
+      // Ne pas marquer HIDDEN+SYSTEM ici : ce flag sur la source empêche le IDropTarget Windows
+      // d'accepter le drop (curseur interdit) et bloque dataTransfer.files côté cible.
+      // Le masquage est appliqué au moment où le placeholder est détecté sur le bureau.
       lastDragPlaceholderBaseName = path.basename(tmpFile);
       lastDragPlaceholderPath = tmpFile;
-      win.webContents.startDrag({ file: tmpFile, icon });
+      markShellDragActive();
+
+      // ⚠️ startDrag doit être appelé dans la fenêtre de temps du dragstart Chromium (~5 ms).
+      // getFileIcon peut prendre 20-50 ms sur un cache froid (icône jamais vue, fichier déplacé),
+      // ce qui retarderait startDrag et ferait partir le drag en HTML5 pur → curseur interdit.
+      // On utilise donc l'icône de repli immédiatement, puis on récupère la vraie en arrière-plan.
+      const fallbackIcon = nativeImage.createFromBuffer(Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNl7BcQAAAABJRU5ErkJggg==",
+        "base64"
+      ));
+      win.webContents.startDrag({ file: tmpFile, icon: fallbackIcon });
+      // Récupération de l'icône en arrière-plan (pour usage futur, startDrag ne peut plus être mis à jour)
+      app.getFileIcon(firstNorm, { size: 'small' }).catch(() => {});
+      scheduleShellDragInactive(30000);
 
       _lastNativeDragStartAt = Date.now();
       _lastDesktopDetectAt = 0;
       try { console.log('[timing] native-drag-start placeholder=', lastDragPlaceholderBaseName); } catch {}
 
-      // ── Finalisation bureau côté MAIN (évite throttling renderer) ──────────
-      // Problème observé: si l'utilisateur ne bouge pas la souris après le drop,
-      // le renderer peut être throttlé et ne pas lancer extractToDesktop tout de suite.
-      // Ici on poll le bureau et on finalise dès que le placeholder apparaît.
-      try {
-        if (_desktopDropPollTimer) {
-          clearInterval(_desktopDropPollTimer);
-          _desktopDropPollTimer = null;
-        }
-        const desktop = app.getPath('desktop');
-        const startedAt = Date.now();
-        const name = lastDragPlaceholderBaseName;
-        _desktopDropPollTimer = setInterval(async () => {
-          try {
-            if (!name) return;
-            const p = path.join(desktop, name);
-            if (!fs.existsSync(p)) {
-              if (Date.now() - startedAt > 35000) {
-                console.log('[desktop-drop] timeout waiting placeholder', name);
-                clearInterval(_desktopDropPollTimer);
-                _desktopDropPollTimer = null;
-              }
-              return;
-            }
-
-            const tDetect = Date.now();
-            console.log('[desktop-drop] placeholder detected after', tDetect - startedAt, 'ms');
-            clearInterval(_desktopDropPollTimer);
-            _desktopDropPollTimer = null;
-
-            // Nettoyer le placeholder rapidement
-            try { shellUtils?.hideFileNow?.(p); } catch {}
-            try { fs.unlinkSync(p); shellUtils?.notifyShellDelete?.(p); } catch {}
-
-            // Finaliser le move réel vers le bureau si on a un drag en cours
-            if (!draggedItem || !Array.isArray(draggedItem.filePaths) || draggedItem.filePaths.length === 0) return;
-            const toMove = [...draggedItem.filePaths];
-            const srcFence = draggedItem.fenceId;
-            draggedItem = null;
-
-            const tMove0 = Date.now();
-            for (const fp of toMove) {
-              try {
-                const src = path.normalize(fp);
-                if (!isPathInFences(src)) continue;
-                const dest = ensureUniqueDest(path.join(desktop, path.basename(src)));
-                await fs.promises.rename(src, dest);
-                shellUtils?.notifyShellCreate?.(dest);
-                shellUtils?.notifyShellDelete?.(src);
-                // Extra refresh pour accélérer l'update visuel sur le Bureau
-                shellUtils?.notifyShellUpdateItem?.(dest);
-              } catch {}
-            }
-            shellUtils?.notifyShellRefreshDesktop?.(desktop);
-            const tMove1 = Date.now();
-            try {
-              const dtFromDrag = _lastNativeDragStartAt ? (tMove1 - _lastNativeDragStartAt) : -1;
-              console.log('[timing] main desktop finalize moved', toMove.length, 'file(s) in', (tMove1 - tMove0), 'ms', 'since drag start', dtFromDrag, 'ms');
-            } catch {}
-
-            if (srcFence && openFences.has(srcFence)) {
-              openFences.get(srcFence).webContents.send("fence-refresh");
-              try { console.log('[timing] fence-refresh sent to source fence after', Date.now() - tMove1, 'ms'); } catch {}
-            }
-          } catch {}
-        }, 100);
-      } catch {}
+      // IMPORTANT:
+      // Ne pas finaliser via un timer côté main pendant le drop Windows.
+      // Cela crée une race au relâchement (double finalisation) qui peut faire crasher.
+      // La finalisation est faite uniquement côté renderer (dragend -> finalizeDesktopDrop).
+      if (_desktopDropPollTimer) {
+        clearInterval(_desktopDropPollTimer);
+        _desktopDropPollTimer = null;
+      }
 
       return true;
     } catch (e) {
       console.warn("[native-drag-start] failed (non-fatal):", e.message);
       return false;
     }
+  };
+
+  // Compat async (anciens appels)
+  ipcMain.handle("native-drag-start", (evt, payload) => {
+    return startNativeDragWithPlaceholder(evt, payload);
+  });
+
+  // Voie synchrone utilisée depuis dragstart renderer (plus fiable pour éviter le curseur interdit)
+  ipcMain.on("native-drag-start-sync", (evt, payload) => {
+    evt.returnValue = startNativeDragWithPlaceholder(evt, payload);
   });
 
   // NOTE: le démarrage du drag OLE est fait côté preload (renderer process).
   // Le lancer depuis le main process a provoqué un crash natif (0xC0000005).
 
-  ipcMain.on('cleanup-drag-placeholder', () => {
-    const desktop = app.getPath('desktop');
-    const candidates = [
-      lastDragPlaceholderBaseName,
-      'boxes-drag-placeholder.tmp', // compat ancien nom
-    ].filter(Boolean);
+  ipcMain.on('cleanup-drag-placeholder', (_evt, payload) => {
+    const names = (payload && Array.isArray(payload.names)) ? payload.names : [];
+    scheduleDeferredDesktopPlaceholderCleanup(
+      names.length ? names : ['boxes-drag-placeholder.tmp']
+    );
+  });
 
-    const doClean = () => {
-      try {
-        for (const name of candidates) {
-          const desktopFile = path.join(desktop, name);
-          if (fs.existsSync(desktopFile)) {
-            fs.unlinkSync(desktopFile);
-            // Notifier le Shell Windows pour effacer l'icône immédiatement
-            shellUtils?.notifyShellDelete(desktopFile);
-            return true;
-          }
-        }
-      } catch {}
-      return false;
-    };
-    // Polling toutes les 200ms pendant 15s max
-    let attempts = 0;
-    const interval = setInterval(() => {
-      attempts++;
-      if (doClean() || attempts >= 75) clearInterval(interval);
-    }, 200);
+  ipcMain.on('shell-drag-started', () => {
+    markShellDragActive();
+    scheduleShellDragInactive(60000);
+  });
+
+  ipcMain.on('shell-drag-ended', () => {
+    scheduleShellDragInactive(200);
+    setTimeout(() => {
+      if (!_shellDragActive) {
+        cleanupResidualDragPlaceholdersOnDesktop([], { scanDesktop: true, minAgeMs: 0 });
+      }
+    }, 350);
+  });
+
+  ipcMain.on('fence-drag-finished', (_evt, fenceId) => {
+    scheduleShellDragInactive(200);
+    if (isValidFenceId(fenceId) && openFences.has(fenceId)) {
+      openFences.get(fenceId).webContents.send('fence-refresh');
+    }
+  });
+
+  ipcMain.on('ole-drag-completed', (_evt, sourceFenceId) => {
+    draggedItem = null;
+    _desktopDropFinalized = true;
+    if (_desktopDropPollTimer) {
+      clearInterval(_desktopDropPollTimer);
+      _desktopDropPollTimer = null;
+    }
+    scheduleShellDragInactive(300);
+    setTimeout(() => {
+      if (!_shellDragActive) {
+        cleanupResidualDragPlaceholdersOnDesktop([], { scanDesktop: true, minAgeMs: 0 });
+      }
+    }, 800);
+    if (isValidFenceId(sourceFenceId) && openFences.has(sourceFenceId)) {
+      openFences.get(sourceFenceId).webContents.send('fence-refresh');
+    }
+  });
+
+  ipcMain.handle('fence-drag-drop-paths', async (_evt, { targetFenceId, filePaths }) => {
+    if (!draggedItem || !isValidFenceId(targetFenceId)) return false;
+    const paths = Array.isArray(filePaths) ? filePaths : [];
+    if (!paths.length) return false;
+    const moved = await movePathsBetweenFences(paths, draggedItem.fenceId, targetFenceId);
+    if (moved) draggedItem = null;
+    return moved;
   });
 
   ipcMain.handle("is-inter-fence-drag", () => {
     return draggedItem !== null;
   });
 
-  // Vérifie si le placeholder de drag est sur le bureau (= dépôt effectif sur le bureau).
-  // Retourne true immédiatement sans bloquer, supprime le placeholder en arrière-plan.
+  // Lecture seule : le placeholder est-il sur le bureau ? (pas de suppression ici — crash si race)
   ipcMain.handle("drag-dropped-on-desktop", () => {
+    if (_desktopDropFinalized) return true;
     const desktop = app.getPath('desktop');
     const candidates = [
       lastDragPlaceholderBaseName,
-      'boxes-drag-placeholder.tmp', // compat ancien nom
+      'boxes-drag-placeholder.tmp',
     ].filter(Boolean);
-
     for (const name of candidates) {
-      const p = path.join(desktop, name);
-      if (!fs.existsSync(p)) continue;
-      if (!_lastDesktopDetectAt) {
-        _lastDesktopDetectAt = Date.now();
-        try {
-          const dt = _lastNativeDragStartAt ? (_lastDesktopDetectAt - _lastNativeDragStartAt) : -1;
-          console.log('[timing] drag-dropped-on-desktop detected after', dt, 'ms', 'name=', name);
-        } catch {}
-      }
-      shellUtils?.hideFileNow?.(p);
-      const tryDelete = (attempts) => {
-        fs.promises.unlink(p)
-          .then(() => shellUtils?.notifyShellDelete(p))
-          .catch(() => { if (attempts > 0) setTimeout(() => tryDelete(attempts - 1), 500); });
-      };
-      tryDelete(20);
-      return true;
+      if (fs.existsSync(path.join(desktop, name))) return true;
     }
     return false;
   });
+
+  ipcMain.handle('finalize-desktop-drop', async () => finalizeDesktopDropIfNeeded());
 
   ipcMain.handle("fence-drag-cancel", () => {
     // Appelé si le drag est abandonné (relâché dans le vide).
@@ -2226,6 +2433,16 @@ async function getLnkIcon(lnkPath) {
     // Annuler le timer d'expiration
     if (draggedItem._expireTimer) { clearTimeout(draggedItem._expireTimer); draggedItem._expireTimer = null; }
 
+    // Capturer le placeholder AVANT les await : nativeDragStart d'un drag suivant peut
+    // tourner en parallèle (IPC différents) et écraser lastDragPlaceholderPath pendant
+    // que ce handler attend le rename — ce qui provoquerait la suppression du placeholder
+    // du nouveau drag et un curseur interdit sur le bureau.
+    const placeholderToClean = lastDragPlaceholderPath;
+    const placeholderBaseToClean = lastDragPlaceholderBaseName;
+    lastDragPlaceholderPath = null;
+    lastDragPlaceholderBaseName = null;
+    if (_desktopDropPollTimer) { clearInterval(_desktopDropPollTimer); _desktopDropPollTimer = null; }
+
     const results = [];
     try {
       const targetDir = path.join(FENCES_BASE_DIR, targetFenceId);
@@ -2251,14 +2468,20 @@ async function getLnkIcon(lnkPath) {
       if (openFences.has(sourceFenceId)) {
         openFences.get(sourceFenceId).webContents.send("fence-refresh");
       }
+      if (openFences.has(targetFenceId)) {
+        openFences.get(targetFenceId).webContents.send("fence-refresh");
+      }
 
-      // Nettoyer le placeholder inter-box (créé par startDrag)
+      // Nettoyer le placeholder capturé au début (valeur isolée du drag en cours)
       try {
-        if (lastDragPlaceholderPath && fs.existsSync(lastDragPlaceholderPath)) {
-          fs.unlinkSync(lastDragPlaceholderPath);
+        if (placeholderToClean && fs.existsSync(placeholderToClean)) {
+          fs.unlinkSync(placeholderToClean);
         }
       } catch {}
-      lastDragPlaceholderPath = null;
+
+      scheduleDeferredDesktopPlaceholderCleanup(
+        placeholderBaseToClean ? [placeholderBaseToClean] : []
+      );
 
       draggedItem = null;
       console.log('[fence-drag-drop] success —', results.length, 'file(s) moved');
@@ -2856,22 +3079,34 @@ async function getLnkIcon(lnkPath) {
       // Clic gauche → afficher/masquer TOUTES les boxes (plus user-friendly)
       tray.on('click', () => {
         const mgr = getManagerWin();
-        // Toujours réafficher le Manager sur clic tray (sinon il peut rester invisible
-        // et l'utilisateur ne sait plus comment relancer les boxes).
+        const mgrWasHidden = !!(mgr && !mgr.isVisible());
+
+        // Toujours réafficher le Manager sur clic tray.
         try {
-          if (mgr && (!mgr.isVisible || !mgr.isVisible())) {
-            mgr.show();
-          }
+          if (mgrWasHidden) mgr.show();
           mgr?.focus?.();
         } catch {}
 
+        if (mgrWasHidden) {
+          // Restauration : le manager était masqué → afficher toutes les boxes sans toggle.
+          for (const win of openFences.values()) { try { win.show(); } catch {} }
+          if (openFences.size === 0) {
+            try {
+              const cfg = readConfig();
+              for (const f of cfg.fences || []) createFence(f.id, f.name);
+              for (const win of openFences.values()) { try { win.show(); } catch {} }
+            } catch {}
+          }
+          return;
+        }
+
+        // Toggle : manager déjà visible → masquer ou afficher les boxes.
         const wins = [...openFences.values()];
         const anyVisible = wins.some(w => {
           try { return w && w.isVisible(); } catch { return false; }
         });
 
         if (anyVisible) {
-          // Masquer les boxes (on NE masque pas le manager pour éviter que "Manager disparaisse")
           for (const win of wins) { try { win.hide(); } catch {} }
           return;
         }
@@ -2928,17 +3163,7 @@ async function getLnkIcon(lnkPath) {
     }
 
     // Nettoyer tout placeholder résiduel sur le bureau (peut bloquer les drops natifs)
-    try {
-      const desktop = app.getPath('desktop');
-      for (const entry of (fs.readdirSync(desktop) || [])) {
-        if (entry === 'boxes-drag-placeholder.tmp' || /^boxes-drag-.*\.tmp$/i.test(entry)) {
-          const residual = path.join(desktop, entry);
-          try { fs.renameSync(residual, path.join(os.tmpdir(), `boxes-drag-cleanup-${Date.now()}-${entry}`)); }
-          catch { try { fs.unlinkSync(residual); } catch {} }
-          shellUtils?.notifyShellDelete(residual);
-        }
-      }
-    } catch {}
+    cleanupResidualDragPlaceholdersOnDesktop();
 
     createDesktopShortcutIfNeeded();
     ensureBaseDir();
@@ -2947,7 +3172,7 @@ async function getLnkIcon(lnkPath) {
     const startHidden = process.argv.includes('--hidden');
 
     const cfg = readConfig();
-    const managerWin = createManager();
+    managerWin = createManager();
 
     // Empêcher la fermeture complète depuis le bouton X du manager — masquer à la place
     managerWin.on('close', (e) => {

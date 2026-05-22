@@ -1,6 +1,6 @@
 {
   "name": "boxes",
-  "version": "3.3.8",
+  "version": "3.4.29",
   "description": "Application de gestion de box multiples",
   "main": "main.js",
   "author": {
@@ -12,8 +12,8 @@
     "stop": "electron . --quit-now",
     "rebuild-native": "electron-rebuild -f -w shell_utils -m native",
     "rebuild:clean": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"npm run stop; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run rebuild-native; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run dist\"",
-    "dist": "electron-builder --win nsis --x64",
-    "dist:portable": "electron-builder --win portable --x64"
+    "dist": "npm version patch --no-git-tag-version && electron-builder --win nsis --x64",
+    "dist:portable": "npm version patch --no-git-tag-version && electron-builder --win portable --x64"
   },
   "dependencies": {
     "canvas": "^3.2.1",

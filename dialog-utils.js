@@ -35,6 +35,8 @@
       min-width: 280px;
       max-width: 360px;
       width: calc(100vw - 48px);
+      max-height: calc(100vh - 80px);
+      overflow: auto;
       animation: du-slide-in 160ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
       font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
     }
@@ -91,6 +93,11 @@
       display: flex;
       gap: 8px;
       justify-content: flex-end;
+      position: sticky;
+      bottom: 0;
+      background: rgba(22, 22, 32, 0.98);
+      padding-top: 10px;
+      margin-top: -4px;
     }
 
     .du-btn {
@@ -150,6 +157,56 @@
   document.head.appendChild(style);
 })();
 
+function _duEnsureDialogVisible(overlay) {
+  try {
+    document.body.classList.add('du-modal-open');
+    // Après rendu, calculer la taille nécessaire pour afficher le dialog complet.
+    requestAnimationFrame(() => {
+      try {
+        const modal = overlay?.querySelector?.('.du-modal');
+        if (!modal) return;
+        // scrollHeight = hauteur totale du contenu, non tronquée par max-height CSS
+        const fullH = modal.scrollHeight;
+        const fullW = modal.getBoundingClientRect().width;
+        const curW = window.innerWidth || 0;
+        const curH = window.innerHeight || 0;
+
+        // Hauteur = contenu + titlebar (28px) + marges de centrage overlay (52px)
+        const wantH = Math.max(280, Math.ceil(fullH + 80));
+        const wantW = Math.max(360, Math.ceil(fullW + 48));
+
+        const growH = Math.max(0, wantH - curH);
+        const growW = Math.max(0, wantW - curW);
+
+        // Hauteur : setContentHeight gère le trick DWM et les fences verrouillées.
+        // Si la fenêtre est trop basse dans l'écran, la remonter d'abord.
+        if (growH > 0 && window?.api?.setContentHeight) {
+          const screenY   = window.screenY || 0;
+          const availH    = screen.availHeight || 1080;
+          const bottomAfterGrow = screenY + wantH;
+          if (bottomAfterGrow > availH) {
+            const dy = availH - wantH - screenY; // négatif = monter
+            window.api.moveWindow?.(0, dy);
+          }
+          window.api.setContentHeight(wantH);
+        }
+        // Largeur : resizeBy si nécessaire (cas rare — dialog plus large que la box)
+        if (growW > 0 && window?.api?.resizeBy) {
+          window.api.resizeBy('southeast', growW, 0).catch?.(() => {});
+        }
+      } catch {}
+    });
+  } catch {}
+}
+
+function _duCleanupDialogState() {
+  try {
+    if (!document.querySelector('.du-overlay')) {
+      document.body.classList.remove('du-modal-open');
+    }
+  } catch {}
+}
+
 
 // ── Échappement HTML (protection XSS) ────────────────────────────
 function _duEscapeHtml(str) {
@@ -178,6 +235,7 @@ function showInputDialog(title, placeholder = '', defaultValue = '') {
       </div>
     `;
     document.body.appendChild(overlay);
+    _duEnsureDialogVisible(overlay);
 
     const input = overlay.querySelector('.du-input');
     input.focus();
@@ -186,11 +244,13 @@ function showInputDialog(title, placeholder = '', defaultValue = '') {
     const handleOk = () => {
       const value = input.value.trim();
       overlay.remove();
+      _duCleanupDialogState();
       resolve(value || null);
     };
 
     const handleCancel = () => {
       overlay.remove();
+      _duCleanupDialogState();
       resolve(null);
     };
 
@@ -232,9 +292,10 @@ function showConfirmDialog(message, { danger = false, icon = null } = {}) {
       </div>
     `;
     document.body.appendChild(overlay);
+    _duEnsureDialogVisible(overlay);
 
-    const handleOk = () => { overlay.remove(); resolve(true);  };
-    const handleCancel = () => { overlay.remove(); resolve(false); };
+    const handleOk = () => { overlay.remove(); _duCleanupDialogState(); resolve(true);  };
+    const handleCancel = () => { overlay.remove(); _duCleanupDialogState(); resolve(false); };
 
     overlay.querySelector('#du-ok').addEventListener('click', handleOk);
     overlay.querySelector('#du-cancel').addEventListener('click', handleCancel);

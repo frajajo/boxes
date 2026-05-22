@@ -26,14 +26,15 @@ const apiCommon = {
   // Version de l'application
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
-  // Drag natif vers le bureau / explorateur Windows
+  // Drag natif placeholder (synchrone pour tenir la fenêtre temporelle dragstart)
   nativeDragStart: (filePaths, fenceId) =>
-    ipcRenderer.invoke('native-drag-start', { filePaths, fenceId }),
+    ipcRenderer.sendSync('native-drag-start-sync', { filePaths, fenceId }),
 
   // Win32: classe de la fenêtre sous le curseur (pour choisir la stratégie de drag)
   getWindowClassUnderCursor: () => {
     try { return shellUtils?.getWindowClassUnderCursor?.() ?? null; } catch { return null; }
   },
+  hasNativeFileDrag: () => !!shellUtils?.startFileDrag,
 
   // Paramètres fence (utiles aussi dans le manager)
   setFenceIconSize: (fenceId, iconSize) =>
@@ -55,7 +56,12 @@ const apiManager = {
   // Démarrage automatique avec Windows
   getAutostart: () => ipcRenderer.invoke('get-autostart'),
   setAutostart: (enable) => ipcRenderer.invoke('set-autostart', enable),
+
+  // Rafraîchissement automatique de la liste (ex: renommage depuis une box)
+  onManagerRefresh: (cb) => ipcRenderer.on('manager-refresh', () => cb()),
 };
+
+let _oleDragBusy = false;
 
 const apiFence = {
   // Fence APIs
@@ -68,6 +74,8 @@ const apiFence = {
   // Fence actions
   copyToFence: (fenceId, fullPath, name) =>
     ipcRenderer.invoke('copy-to-fence', { fenceId, srcFullPath: fullPath, destName: name }),
+  moveToFence: (fenceId, fullPath, name) =>
+    ipcRenderer.invoke('move-to-fence', { fenceId, srcFullPath: fullPath, destName: name }),
   listFenceItems: (fenceId) => ipcRenderer.invoke('list-fence-items', fenceId),
   openFile: (filePath) => ipcRenderer.invoke('open-file', filePath),
   revealInFolder: (filePath) => ipcRenderer.invoke('reveal-in-folder', filePath),
@@ -92,22 +100,29 @@ const apiFence = {
     ipcRenderer.invoke('fence-drag-start', { filePaths, fenceId }),
   fenceDragDrop: (targetFenceId) =>
     ipcRenderer.invoke('fence-drag-drop', { targetFenceId }),
+  fenceDragDropPaths: (targetFenceId, filePaths) =>
+    ipcRenderer.invoke('fence-drag-drop-paths', { targetFenceId, filePaths }),
   fenceDragCancel: () => ipcRenderer.invoke('fence-drag-cancel'),
   isInterFenceDrag: () => ipcRenderer.invoke('is-inter-fence-drag'),
   dragDroppedOnDesktop: () => ipcRenderer.invoke('drag-dropped-on-desktop'),
+  finalizeDesktopDrop: () => ipcRenderer.invoke('finalize-desktop-drop'),
 
   // OLE drag (source) : CF_HDROP + format interne BoxesInternalDrag
   startOleDrag: (filePaths, sourceFenceId) => {
     const paths = Array.isArray(filePaths) ? filePaths : [filePaths];
-    // Démarrer depuis le preload (renderer process). DoDragDrop est modal mais
-    // possède son message pump OLE. On évite ainsi de faire crasher le main.
-    const internal = [String(sourceFenceId || ''), ...paths].join('\n');
     if (!shellUtils?.startFileDrag) return Promise.resolve(0);
+    if (_oleDragBusy) return Promise.resolve(0);
+    _oleDragBusy = true;
+    try { ipcRenderer.send('shell-drag-started'); } catch {}
+    const internal = [String(sourceFenceId || ''), ...paths].join('\n');
     try {
-      const effect = shellUtils.startFileDrag(paths, internal);
-      return Promise.resolve(effect || 0);
+      const effect = shellUtils.startFileDrag(paths, internal) || 0;
+      try { ipcRenderer.send('ole-drag-completed', sourceFenceId || null); } catch {}
+      return Promise.resolve(effect);
     } catch {
       return Promise.resolve(0);
+    } finally {
+      _oleDragBusy = false;
     }
   },
 
@@ -135,7 +150,9 @@ const apiFence = {
   toggleRollup: (fenceId) => ipcRenderer.invoke('fence-toggle-rollup', fenceId),
   setFenceLocked: (fenceId, locked) => ipcRenderer.invoke('fence-set-locked', fenceId, locked),
   onLockedStateChanged: (cb) => ipcRenderer.on('locked-state-changed', (_evt, locked) => cb(locked)),
-  cleanupDragPlaceholder: () => ipcRenderer.send('cleanup-drag-placeholder'),
+  cleanupDragPlaceholder: (names) =>
+    ipcRenderer.send('cleanup-drag-placeholder', names?.length ? { names } : undefined),
+  shellDragEnded: () => ipcRenderer.send('shell-drag-ended'),
   moveWindow: (dx, dy) => ipcRenderer.send('move-window', dx, dy),
   setContentHeight: (height) => ipcRenderer.send('set-content-height', height),
   restoreLockedBounds: () => ipcRenderer.send('restore-locked-bounds'),
