@@ -1046,13 +1046,13 @@ async function loadFenceItems() {
             // Fallback instantané vers la version stable si OLE n'a pas démarré.
             if (!effect) {
               window.__oleDragSession = false;
-              try { window.api.nativeDragStart(pathsSnapshot, currentFenceId); } catch {}
+              window.api.nativeDragStart(pathsSnapshot, currentFenceId).catch(() => {});
             }
           }, 0);
         } else {
           // Chemin stable placeholder (version de secours)
           window.__oleDragSession = false;
-          try { window.api.nativeDragStart(pathsSnapshot, currentFenceId); } catch {}
+          window.api.nativeDragStart(pathsSnapshot, currentFenceId).catch(() => {});
         }
       } catch {}
     });

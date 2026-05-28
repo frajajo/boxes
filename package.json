@@ -1,6 +1,6 @@
 {
   "name": "boxes",
-  "version": "3.4.29",
+  "version": "3.4.39",
   "description": "Application de gestion de box multiples",
   "main": "main.js",
   "author": {

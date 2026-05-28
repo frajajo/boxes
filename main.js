@@ -652,6 +652,7 @@ let _lastInterFenceDropKey = '';
 let _lastInterFenceDropAt = 0;
 let _desktopDropFinalized = false;
 let _desktopDropFinalizing = false;
+const ENABLE_STARDOCK_DND_EXPERIMENT = process.argv.includes('--stardock-dnd-experiment');
 
 function shouldSkipDuplicateInterFenceDrop(sourceFenceId, targetFenceId, paths) {
   const key = `${sourceFenceId || ''}->${targetFenceId || ''}:${(paths || []).join('|')}`;
@@ -1077,7 +1078,11 @@ function createFence(fenceId, fenceName) {
     },
   });
 
-  attachOleDropTargetToFenceWindow(win, fenceId);
+  // Le DropTarget OLE est réservé au mode expérimental.
+  // En mode normal, il peut intercepter l'inter-box et provoquer des copies.
+  if (ENABLE_STARDOCK_DND_EXPERIMENT) {
+    attachOleDropTargetToFenceWindow(win, fenceId);
+  }
 
   // Sécurité navigation : aucune ouverture/navigations externes depuis le renderer.
   // (deny-by-default)

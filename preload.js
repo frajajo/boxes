@@ -26,9 +26,9 @@ const apiCommon = {
   // Version de l'application
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
-  // Drag natif placeholder (synchrone pour tenir la fenêtre temporelle dragstart)
+  // Drag natif placeholder (async)
   nativeDragStart: (filePaths, fenceId) =>
-    ipcRenderer.sendSync('native-drag-start-sync', { filePaths, fenceId }),
+    ipcRenderer.invoke('native-drag-start', { filePaths, fenceId }),
 
   // Win32: classe de la fenêtre sous le curseur (pour choisir la stratégie de drag)
   getWindowClassUnderCursor: () => {
