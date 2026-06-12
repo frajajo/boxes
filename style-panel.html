@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Apparence</title>
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="style-panel-body">
+  <div class="style-panel style-panel-window">
+    <div class="style-panel-header">
+      <div class="style-panel-title">Apparence</div>
+      <button type="button" class="style-panel-close" title="Fermer">&#x2715;</button>
+    </div>
+
+    <div class="style-row">
+      <label>Couleur</label>
+      <div class="color-presets">
+        <button class="color-swatch" data-color="#1e1e1e" style="background:#1e1e1e" title="Sombre"></button>
+        <button class="color-swatch" data-color="#0d1b2a" style="background:#0d1b2a" title="Marine"></button>
+        <button class="color-swatch" data-color="#1a1a2e" style="background:#1a1a2e" title="Nuit"></button>
+        <button class="color-swatch" data-color="#1b2838" style="background:#1b2838" title="Acier"></button>
+        <button class="color-swatch" data-color="#2d1b1b" style="background:#2d1b1b" title="Bordeaux"></button>
+        <button class="color-swatch" data-color="#1b2d1b" style="background:#1b2d1b" title="Forêt"></button>
+        <button class="color-swatch" data-color="#2a1f0e" style="background:#2a1f0e" title="Café"></button>
+        <button class="color-swatch" data-color="#1e1e3a" style="background:#1e1e3a" title="Violet"></button>
+        <input type="color" class="color-custom" title="Couleur personnalisée" />
+      </div>
+    </div>
+
+    <div class="style-row">
+      <label>Opacité <span class="opacity-val"></span></label>
+      <input type="range" class="opacity-slider" min="0.1" max="1" step="0.05" />
+    </div>
+
+    <div class="style-row" style="margin-bottom:4px">
+      <label class="style-toggle-row">
+        <span>Afficher les extensions</span>
+        <span class="ext-toggle-wrap">
+          <input type="checkbox" class="ext-toggle-input ext-toggle" />
+          <span class="ext-toggle-track"><span class="ext-toggle-thumb"></span></span>
+        </span>
+      </label>
+    </div>
+
+    <div class="style-row" style="margin-bottom:4px">
+      <label class="style-toggle-row">
+        <span>Ranger le bureau</span>
+        <span class="ext-toggle-wrap">
+          <input type="checkbox" class="ext-toggle-input ext-toggle auto-organize-input" />
+          <span class="ext-toggle-track"><span class="ext-toggle-thumb"></span></span>
+        </span>
+      </label>
+      <div class="style-panel-hint">Déplace les originaux du bureau dans un dossier du nom de la box</div>
+    </div>
+  </div>
+  <script src="style-panel-renderer.js"></script>
+</body>
+</html>

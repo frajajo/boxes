@@ -101,6 +101,11 @@ let _refreshTimer = null;
 
     buildSortMenu();
     buildStyleMenu();
+    window.api.onStyleChanged((style) => {
+      if (!style) return;
+      currentStyle = style;
+      applyStyle(style);
+    });
     buildLockButton();
 
     // Charger l'ordre manuel sauvegardé
@@ -601,152 +606,15 @@ function buildStyleMenu() {
   if (!actionsEl || actionsEl.dataset.styleBuilt) return;
   actionsEl.dataset.styleBuilt = '1';
 
-  // Bouton palette 🎨
   const btn = document.createElement('button');
   btn.className = 'sort-btn';
   btn.title = 'Apparence';
   btn.textContent = '🎨';
-  // Insérer AVANT le bouton de tri
   actionsEl.insertBefore(btn, actionsEl.firstChild);
 
-  // Panel flottant
-  const panel = document.createElement('div');
-  panel.className = 'style-panel';
-  panel.innerHTML = `
-    <div class="style-panel-title">Apparence</div>
-
-    <div class="style-row">
-      <label>Couleur</label>
-      <div class="color-presets">
-        <button class="color-swatch" data-color="#1e1e1e" style="background:#1e1e1e" title="Sombre"></button>
-        <button class="color-swatch" data-color="#0d1b2a" style="background:#0d1b2a" title="Marine"></button>
-        <button class="color-swatch" data-color="#1a1a2e" style="background:#1a1a2e" title="Nuit"></button>
-        <button class="color-swatch" data-color="#1b2838" style="background:#1b2838" title="Acier"></button>
-        <button class="color-swatch" data-color="#2d1b1b" style="background:#2d1b1b" title="Bordeaux"></button>
-        <button class="color-swatch" data-color="#1b2d1b" style="background:#1b2d1b" title="Forêt"></button>
-        <button class="color-swatch" data-color="#2a1f0e" style="background:#2a1f0e" title="Café"></button>
-        <button class="color-swatch" data-color="#1e1e3a" style="background:#1e1e3a" title="Violet"></button>
-        <input type="color" class="color-custom" title="Couleur personnalisée" />
-      </div>
-    </div>
-
-    <div class="style-row">
-      <label>Opacité <span class="opacity-val"></span></label>
-      <input type="range" class="opacity-slider" min="0.1" max="1" step="0.05" />
-    </div>
-
-    <div class="style-row" style="margin-bottom:4px">
-      <label style="justify-content:space-between;align-items:center;display:flex">
-        <span>Afficher les extensions</span>
-        <label class="ext-toggle-wrap">
-          <input type="checkbox" class="ext-toggle-input" />
-          <span class="ext-toggle-track"><span class="ext-toggle-thumb"></span></span>
-        </label>
-      </label>
-    </div>
-
-    <div class="style-row" style="margin-bottom:4px">
-      <label style="justify-content:space-between;align-items:center;display:flex">
-        <span>Ranger le bureau</span>
-        <label class="ext-toggle-wrap">
-          <input type="checkbox" class="ext-toggle-input auto-organize-input" />
-          <span class="ext-toggle-track"><span class="ext-toggle-thumb"></span></span>
-        </label>
-      </label>
-      <div style="font-size:10px;color:#888;margin-top:2px">Déplace les originaux du bureau dans un dossier du nom de la box</div>
-    </div>
-  `;
-  panel.style.display = 'none';
-  document.body.appendChild(panel);
-
-  const opacitySlider = panel.querySelector('.opacity-slider');
-  const opacityVal = panel.querySelector('.opacity-val');
-  const colorCustom = panel.querySelector('.color-custom');
-
-  // Initialiser avec le style courant
-  opacitySlider.value = currentStyle.opacity;
-  opacityVal.textContent = Math.round(currentStyle.opacity * 100) + '%';
-  colorCustom.value = currentStyle.color;
-
-  // Marquer la swatch active
-  function updateActiveSwatch(color) {
-    panel.querySelectorAll('.color-swatch').forEach(s => {
-      s.classList.toggle('active', s.dataset.color === color);
-    });
-  }
-  updateActiveSwatch(currentStyle.color);
-
-  async function saveStyle() {
-    await window.api.setFenceStyle(currentFenceId, currentStyle.color, currentStyle.opacity);
-    applyStyle(currentStyle);
-    opacityVal.textContent = Math.round(currentStyle.opacity * 100) + '%';
-  }
-
-  // Clic sur une swatch
-  panel.querySelectorAll('.color-swatch').forEach(s => {
-    s.addEventListener('click', async () => {
-      currentStyle.color = s.dataset.color;
-      colorCustom.value = s.dataset.color;
-      updateActiveSwatch(s.dataset.color);
-      await saveStyle();
-    });
-  });
-
-  // Couleur custom
-  colorCustom.addEventListener('input', async () => {
-    currentStyle.color = colorCustom.value;
-    updateActiveSwatch(colorCustom.value);
-    await saveStyle();
-  });
-
-  // Opacité
-  opacitySlider.addEventListener('input', async () => {
-    currentStyle.opacity = parseFloat(opacitySlider.value);
-    await saveStyle();
-  });
-
-  // Toggle extensions
-  const extToggle = panel.querySelector('.ext-toggle-input');
-  extToggle.checked = currentShowExtensions;
-  extToggle.addEventListener('change', async () => {
-    currentShowExtensions = extToggle.checked;
-    // setFenceShowExtensions déclenche onShowExtensionsChanged qui appelle loadFenceItems
-    await window.api.setFenceShowExtensions(currentFenceId, currentShowExtensions);
-  });
-
-  // Toggle auto-organisation bureau
-  const autoOrganizeToggle = panel.querySelector('.auto-organize-input');
-  window.api.getAutoOrganizeDesktop().then(v => { autoOrganizeToggle.checked = v; });
-  autoOrganizeToggle.addEventListener('change', async () => {
-    await window.api.setAutoOrganizeDesktop(autoOrganizeToggle.checked);
-  });
-
-  // Toggle panel
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
-    const r = btn.getBoundingClientRect();
-    panel.style.right = (window.innerWidth - r.right) + 'px';
-    panel.style.left = 'auto';
-    panel.style.top = (r.bottom + 4) + 'px';
-    panel.style.bottom = 'auto';
-    const isOpening = panel.style.display === 'none';
-    panel.style.display = isOpening ? 'block' : 'none';
-    if (isOpening) {
-      window.api.setContentHeight(r.bottom + 4 + panel.offsetHeight + 8);
-    } else {
-      if (isLocked) {
-        window.api.restoreLockedBounds();
-      } else {
-        autoResize();
-      }
-    }
-  });
-
-  window.addEventListener('click', () => {
-    if (panel.style.display !== 'none') {
-      panel.style.display = 'none';
-      autoResize();
-    }
+    window.api.toggleStylePanel();
   });
 }
 

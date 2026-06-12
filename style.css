@@ -377,19 +377,36 @@ body.locked #resize-br {
 }
 
 /* ─────────────────────────────────────────────── */
-/* Panel d'apparence (couleur + opacité)           */
+/* Panel d'apparence (fenêtre flottante dédiée)    */
 /* ─────────────────────────────────────────────── */
 
-.style-panel {
-  position: fixed;
-  z-index: 99999;
-  background: rgba(20, 20, 20, 0.97);
-  border: 1px solid rgba(255,255,255,0.2);
+body.style-panel-body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text);
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+
+.style-panel-window {
+  width: 100%;
+  height: 100vh;
+  box-sizing: border-box;
+  background: rgba(20, 20, 20, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 8px;
-  box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
   padding: 12px 14px;
-  min-width: 220px;
   backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.style-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
 }
 
 .style-panel-title {
@@ -397,8 +414,46 @@ body.locked #resize-br {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: rgba(255,255,255,0.4);
-  margin-bottom: 10px;
+  color: rgba(255, 255, 255, 0.4);
+  margin: 0;
+}
+
+.style-panel-close {
+  all: unset;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.style-panel-close:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.style-toggle-row {
+  justify-content: space-between;
+  align-items: center;
+  display: flex;
+  width: 100%;
+}
+
+.style-panel-hint {
+  font-size: 10px;
+  color: #888;
+  margin-top: 2px;
+}
+
+.style-panel {
+  background: rgba(20, 20, 20, 0.97);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+  padding: 12px 14px;
+  box-sizing: border-box;
+  backdrop-filter: blur(10px);
 }
 
 .style-row {

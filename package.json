@@ -1,6 +1,6 @@
 {
   "name": "boxes",
-  "version": "3.4.39",
+  "version": "3.4.48",
   "description": "Application de gestion de box multiples",
   "main": "main.js",
   "author": {
@@ -10,10 +10,12 @@
   "scripts": {
     "start": "electron .",
     "stop": "electron . --quit-now",
+    "stop-for-build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-for-build.ps1",
+    "clean:dist": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"if (Test-Path dist) { Remove-Item -Recurse -Force dist }\"",
     "rebuild-native": "electron-rebuild -f -w shell_utils -m native",
-    "rebuild:clean": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"npm run stop; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run rebuild-native; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run dist\"",
-    "dist": "npm version patch --no-git-tag-version && electron-builder --win nsis --x64",
-    "dist:portable": "npm version patch --no-git-tag-version && electron-builder --win portable --x64"
+    "rebuild:clean": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"npm run stop-for-build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run rebuild-native; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run dist\"",
+    "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dist.ps1",
+    "dist:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dist.ps1 -Target portable"
   },
   "dependencies": {
     "canvas": "^3.2.1",
@@ -35,9 +37,11 @@
       "main.js",
       "preload.js",
       "renderer.js",
+      "style-panel-renderer.js",
       "manager-renderer.js",
       "dialog-utils.js",
       "fence.html",
+      "style-panel.html",
       "manager.html",
       "style.css",
       "manager-style.css",
@@ -79,7 +83,7 @@
       "artifactName": "Boxes-portable-${version}.exe"
     },
     "directories": {
-      "output": "E:\\fences-lite\\dist",
+      "output": "build",
       "buildResources": "assets"
     },
     "extraResources": [

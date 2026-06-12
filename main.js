@@ -636,9 +636,12 @@ const FENCES_BASE_DIR = path.join(app.getPath("userData"), "fences");
 const CONFIG_PATH = path.join(app.getPath("userData"), "config.json");
 const TITLE_HEIGHT = 32; // hauteur de la barre de titre (28px + bordures)
 const FENCE_MIN_W = 160;  // largeur minimale d'une fence
+const STYLE_PANEL_W = 260;
+const STYLE_PANEL_H = 360;
 
 // États
 const openFences = new Map();
+const stylePanelWindows = new Map(); // fenceId -> { panelWin, parentWin, onParentMove, onParentResize, onParentClose }
 let managerWin = null;
 let draggedItem = null;
 let lastDragPlaceholderBaseName = null; // basename du placeholder startDrag courant (inter-box / bureau)
@@ -1187,6 +1190,111 @@ function createFence(fenceId, fenceName) {
   return win;
 }
 
+function getStylePanelBounds(parentWin) {
+  const pb = parentWin.getBounds();
+  let x = Math.round(pb.x + (pb.width - STYLE_PANEL_W) / 2);
+  let y = Math.round(pb.y + (pb.height - STYLE_PANEL_H) / 2);
+
+  // Garder la fenetre entierement visible (croix de fermeture incluse)
+  const display = screen.getDisplayMatching({ x, y, width: STYLE_PANEL_W, height: STYLE_PANEL_H });
+  const wa = display.workArea;
+  x = Math.max(wa.x, Math.min(x, wa.x + wa.width - STYLE_PANEL_W));
+  y = Math.max(wa.y, Math.min(y, wa.y + wa.height - STYLE_PANEL_H));
+
+  return { x, y, width: STYLE_PANEL_W, height: STYLE_PANEL_H };
+}
+
+function repositionStylePanel(parentWin, panelWin) {
+  if (!parentWin || parentWin.isDestroyed() || !panelWin || panelWin.isDestroyed()) return;
+  panelWin.setBounds(getStylePanelBounds(parentWin));
+}
+
+function detachStylePanelListeners(fenceId) {
+  const entry = stylePanelWindows.get(fenceId);
+  if (!entry) return;
+  const { parentWin, onParentMove, onParentResize, onParentClose } = entry;
+  if (parentWin && !parentWin.isDestroyed()) {
+    parentWin.removeListener('move', onParentMove);
+    parentWin.removeListener('resize', onParentResize);
+    parentWin.removeListener('close', onParentClose);
+  }
+  stylePanelWindows.delete(fenceId);
+}
+
+function closeStylePanelForFence(fenceId) {
+  const entry = stylePanelWindows.get(fenceId);
+  if (!entry) return;
+  detachStylePanelListeners(fenceId);
+  if (entry.panelWin && !entry.panelWin.isDestroyed()) {
+    entry.panelWin.close();
+  }
+}
+
+function toggleStylePanel(parentWin, fenceId) {
+  if (stylePanelWindows.has(fenceId)) {
+    closeStylePanelForFence(fenceId);
+    return false;
+  }
+
+  const panelWin = new BrowserWindow({
+    ...getStylePanelBounds(parentWin),
+    parent: parentWin,
+    modal: true,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    skipTaskbar: true,
+    show: false,
+    focusable: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      sandbox: false,
+      nodeIntegration: false,
+      contextIsolation: true,
+      additionalArguments: [`--fence-id=${fenceId}`, '--style-panel=1'],
+    },
+  });
+
+  panelWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  panelWin.webContents.on('will-navigate', (e, url) => {
+    try {
+      if (!url || typeof url !== 'string') { e.preventDefault(); return; }
+      if (url.startsWith('file:')) return;
+    } catch {}
+    e.preventDefault();
+  });
+
+  const onParentMove = () => repositionStylePanel(parentWin, panelWin);
+  const onParentResize = () => repositionStylePanel(parentWin, panelWin);
+  const onParentClose = () => closeStylePanelForFence(fenceId);
+
+  parentWin.on('move', onParentMove);
+  parentWin.on('resize', onParentResize);
+  parentWin.on('close', onParentClose);
+
+  stylePanelWindows.set(fenceId, {
+    panelWin,
+    parentWin,
+    onParentMove,
+    onParentResize,
+    onParentClose,
+  });
+
+  panelWin.on('closed', () => detachStylePanelListeners(fenceId));
+
+  panelWin.loadFile('style-panel.html');
+  panelWin.once('ready-to-show', () => {
+    repositionStylePanel(parentWin, panelWin);
+    panelWin.show();
+    panelWin.focus();
+  });
+
+  return true;
+}
+
 // ─────────────────────────────────────────────
 // MANAGER
 // ─────────────────────────────────────────────
@@ -1384,7 +1492,32 @@ ipcMain.handle("get-current-fence-id", (evt) => {
   for (const [id, w] of openFences.entries()) {
     if (w === win) return id;
   }
+  for (const [id, entry] of stylePanelWindows.entries()) {
+    if (entry.panelWin === win) return id;
+  }
   return null;
+});
+
+ipcMain.handle('toggle-style-panel', (evt) => {
+  const parentWin = BrowserWindow.fromWebContents(evt.sender);
+  if (!parentWin || parentWin.isDestroyed()) return false;
+  let fenceId = null;
+  for (const [id, w] of openFences.entries()) {
+    if (w === parentWin) { fenceId = id; break; }
+  }
+  if (!fenceId) return false;
+  return toggleStylePanel(parentWin, fenceId);
+});
+
+ipcMain.handle('close-style-panel', (evt) => {
+  const win = BrowserWindow.fromWebContents(evt.sender);
+  for (const [id, entry] of stylePanelWindows.entries()) {
+    if (entry.panelWin === win) {
+      closeStylePanelForFence(id);
+      return true;
+    }
+  }
+  return false;
 });
 
 ipcMain.handle("get-fence-info", (_evt, fenceId) => {
@@ -1398,6 +1531,12 @@ ipcMain.handle("set-fence-style", (_evt, { fenceId, color, opacity }) => {
   if (f) {
     f.style = { color: color || "#1e1e1e", opacity: opacity ?? 0.6 };
     writeConfig(cfg);
+    if (openFences.has(fenceId)) {
+      const win = openFences.get(fenceId);
+      const send = () => win.webContents.send('style-changed', f.style);
+      if (win.webContents.isLoading()) win.webContents.once('did-finish-load', send);
+      else send();
+    }
   }
   return f?.style ?? null;
 });

@@ -20,6 +20,7 @@ function guessMime(p) {
 }
 
 const isFenceWindow = process.argv.some(a => typeof a === 'string' && a.startsWith('--fence-id='));
+const isStylePanel = process.argv.some(a => a === '--style-panel=1');
 
 // APIs communes (utiles dans manager et fences)
 const apiCommon = {
@@ -167,11 +168,27 @@ const apiFence = {
     ipcRenderer.invoke('pick-icon-file'),
   readFileAsBuffer: (filePath) =>
     ipcRenderer.invoke('read-file-as-buffer', filePath),
+
+  toggleStylePanel: () => ipcRenderer.invoke('toggle-style-panel'),
+  onStyleChanged: (cb) => ipcRenderer.on('style-changed', (_evt, style) => cb(style)),
 };
 
-const api = isFenceWindow
-  ? { ...apiCommon, ...apiFence }
-  : { ...apiCommon, ...apiManager };
+const apiStylePanel = {
+  getCurrentFenceId: () => ipcRenderer.invoke('get-current-fence-id'),
+  getFenceInfo: (fenceId) => ipcRenderer.invoke('get-fence-info', fenceId),
+  setFenceStyle: (fenceId, color, opacity) => ipcRenderer.invoke('set-fence-style', { fenceId, color, opacity }),
+  setFenceShowExtensions: (fenceId, showExtensions) =>
+    ipcRenderer.invoke('set-fence-show-extensions', { fenceId, showExtensions }),
+  getAutoOrganizeDesktop: () => ipcRenderer.invoke('get-auto-organize-desktop'),
+  setAutoOrganizeDesktop: (enable) => ipcRenderer.invoke('set-auto-organize-desktop', enable),
+  closeStylePanel: () => ipcRenderer.invoke('close-style-panel'),
+};
+
+const api = isStylePanel
+  ? { ...apiCommon, ...apiStylePanel }
+  : isFenceWindow
+    ? { ...apiCommon, ...apiFence }
+    : { ...apiCommon, ...apiManager };
 
 Object.freeze(api);
 contextBridge.exposeInMainWorld('api', api);
