@@ -2,9 +2,6 @@
 
 const container = document.getElementById('container');
 const titleEl = document.querySelector('#titlebar .title');
-// Expérimentation "Stardock-like" : drag OLE prioritaire.
-// Mettre à false pour revenir immédiatement au mode stable placeholder.
-const USE_STARDOCK_OLE_EXPERIMENT = false;
 const TRANSPARENT_DRAG_IMG = (() => {
   // Canvas 1x1 transparent prêt immédiatement (contrairement à Image qui peut
   // ne pas être décodée à temps pendant dragstart).
@@ -14,9 +11,12 @@ const TRANSPARENT_DRAG_IMG = (() => {
   return c;
 })();
 
+const USE_STARDOCK_OLE_EXPERIMENT = false;
+
 let currentFenceId = null;
 let currentStyle = { color: '#1e1e1e', opacity: 0.6 };
 let currentIconSize = 48; // px — 32 | 48 | 60 | 256
+let currentColWidth = null; // largeur colonne collection (px), null = iconSize + 16
 let currentShowExtensions = false;
 
 // ── CSS dynamique pour l'état roulé (box réduite à sa barre de titre) ──
@@ -28,6 +28,37 @@ let currentShowExtensions = false;
 
 function applyRolledState(isRolled) {
   document.body.classList.toggle('rolled', !!isRolled);
+}
+
+function showImportToast(message) {
+  let el = document.getElementById('import-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'import-toast';
+    el.className = 'import-toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.classList.add('visible');
+  clearTimeout(el._hideTimer);
+  el._hideTimer = setTimeout(() => el.classList.remove('visible'), 5000);
+}
+
+function handleMoveToFenceResult(result) {
+  if (!result || typeof result !== 'object' || !result.copyOnly) return;
+  if (result.reason === 'protected-desktop') {
+    if (result.hiddenOriginal) {
+      showImportToast(
+        'Raccourci du bureau public : copié dans la box. L\'original a été masqué sur le bureau.'
+      );
+    } else {
+      showImportToast(
+        'Raccourci du bureau public : copié dans la box. L\'original reste visible (droits Windows).'
+      );
+    }
+  } else if (result.reason === 'permission-denied') {
+    showImportToast('Fichier copié : déplacement impossible (droits insuffisants).');
+  }
 }
 
 // Extensions toujours masquées (fichiers système)
@@ -48,6 +79,25 @@ let manualOrder = []; // ordre manuel persisté (basenames)
 // Évite un "flash vide" lors des déplacements OLE (FS pas encore à jour)
 let _lastNonEmptyAt = 0;
 let _refreshTimer = null;
+let _pendingFenceRefresh = false;
+
+function isInterFenceDragActive() {
+  return !!(window.__interFenceDrag || window.__globalInterFenceDrag);
+}
+
+function scheduleFenceItemsRefresh(delayMs = 120) {
+  clearTimeout(_refreshTimer);
+  _refreshTimer = setTimeout(() => { loadFenceItems(); }, delayMs);
+}
+
+function requestFenceItemsRefresh() {
+  if (isInterFenceDragActive()) {
+    _pendingFenceRefresh = true;
+    return;
+  }
+  _lastNonEmptyAt = 0;
+  scheduleFenceItemsRefresh();
+}
 
 // ───────────────────────────────────────────────
 // Initialisation : récupérer l'ID de la fence
@@ -79,7 +129,11 @@ let _refreshTimer = null;
     if (fenceInfo?.iconSize) {
       currentIconSize = fenceInfo.iconSize;
     }
+    if (typeof fenceInfo?.colWidth === 'number' && fenceInfo.colWidth > 0) {
+      currentColWidth = fenceInfo.colWidth;
+    }
     applyIconSize(currentIconSize);
+    applyColWidth(currentColWidth);
 
     // Appliquer le réglage d'affichage des extensions
     if (typeof fenceInfo?.showExtensions === 'boolean') {
@@ -115,11 +169,16 @@ let _refreshTimer = null;
 
     // Rafraîchir si une autre fence a déplacé un fichier ici (debounce pour éviter flash)
     window.api.onFenceRefresh(() => {
-      clearTimeout(_refreshTimer);
-      // Bypass du retry "transitoire" : fence-refresh signifie que le main process
-      // a confirmé un changement réel — l'état vide n'est pas transitoire.
-      _lastNonEmptyAt = 0;
-      _refreshTimer = setTimeout(() => { loadFenceItems(); }, 120);
+      requestFenceItemsRefresh();
+    });
+
+    window.__globalInterFenceDrag = false;
+    window.api.onInterFenceDragPhase?.((active) => {
+      window.__globalInterFenceDrag = !!active;
+      if (!active && _pendingFenceRefresh) {
+        _pendingFenceRefresh = false;
+        scheduleFenceItemsRefresh(80);
+      }
     });
 
     // Mettre à jour la taille des icônes en temps réel
@@ -127,8 +186,17 @@ let _refreshTimer = null;
       const info = await window.api.getFenceInfo(currentFenceId);
       const newSize = size ?? info?.iconSize ?? currentIconSize;
       currentIconSize = newSize;
+      if (!currentColWidth || currentColWidth < newSize + 16) {
+        currentColWidth = newSize + 16;
+      }
       applyIconSize(newSize);
       await loadFenceItems();
+    });
+
+    window.api.onColWidthChanged((width) => {
+      currentColWidth = width;
+      applyColWidth(width);
+      loadFenceItems();
     });
 
     // Mettre à jour l'affichage des extensions en temps réel
@@ -220,14 +288,21 @@ rollupZone?.addEventListener('dblclick', async () => {
   await window.api.toggleRollup(currentFenceId);
 });
 
-// ───────────────────────────────────────────────
-// Drag & Drop
-// ───────────────────────────────────────────────
+// ── Drag & Drop (réception) ───────────────────────────────────────────────
 
-// Empêcher le comportement par défaut du navigateur sur dragover uniquement
-// NE PAS intercepter 'drop' sur window — cela vide dataTransfer.files avant
-// que le listener sur #container ne puisse les lire
-window.addEventListener('dragover', e => e.preventDefault(), false);
+function shouldShowMoveDropEffect(e) {
+  if (window.__interFenceDrag || window.__globalInterFenceDrag) return true;
+  let types = [];
+  try { types = Array.from(e.dataTransfer?.types || []); } catch {}
+  return types.includes('application/x-boxes-internal') || types.includes('Files');
+}
+
+document.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer && shouldShowMoveDropEffect(e)) {
+    e.dataTransfer.dropEffect = 'move';
+  }
+}, true);
 
 // ── Drag visuel sur le container ──
 container.addEventListener('dragenter', e => {
@@ -238,17 +313,19 @@ container.addEventListener('dragenter', e => {
 container.addEventListener('dragover', e => {
   e.preventDefault();
   e.stopPropagation();
-  // window.__interFenceDrag est positionné dès le dragstart dans la même session
-  // C'est fiable pour l'indicateur visuel (pas besoin d'IPC async ici)
-  if (window.__interFenceDrag) {
+  let types = [];
+  try { types = Array.from(e.dataTransfer?.types || []); } catch {}
+  const looksInter = types.includes('application/x-boxes-internal');
+  const looksFiles = types.includes('Files');
+  const isReceivingInterDrag = (window.__globalInterFenceDrag || looksInter) && !window.__interFenceDrag;
+  if (isReceivingInterDrag) {
     container.classList.add('drop-inter');
     container.classList.remove('drop-hint');
-    e.dataTransfer.dropEffect = 'move';
-  } else {
+  } else if (looksFiles && !window.__interFenceDrag) {
     container.classList.add('drop-hint');
     container.classList.remove('drop-inter');
-    e.dataTransfer.dropEffect = 'move';
   }
+  e.dataTransfer.dropEffect = 'move';
 });
 
 container.addEventListener('dragleave', e => {
@@ -272,15 +349,20 @@ container.addEventListener('drop', async (e) => {
   // Détection synchrone du drag inter-box via les données HTML5 (fiable quand startDrag
   // n'a pas remplacé le drag par un drag OLE natif).
   let isHtmlInterFenceDrag = false;
+  let internalPayload = null;
   try {
-    isHtmlInterFenceDrag = !!(e.dataTransfer.getData('application/x-boxes-internal'));
+    const raw = e.dataTransfer.getData('application/x-boxes-internal');
+    if (raw) {
+      isHtmlInterFenceDrag = true;
+      internalPayload = JSON.parse(raw);
+    }
   } catch {}
 
   try {
     console.log('[container drop] fence', currentFenceId, 'files:', files.map(f => (f?.path || f?.name || '')), 'htmlInter=', isHtmlInterFenceDrag);
   } catch {}
 
-  // Inter-box via placeholder startDrag: Windows dépose un fichier temp `boxes-drag-*.tmp`
+  // Inter-box via placeholder startDrag
   // dans `dataTransfer.files`. Dans ce cas, on demande au main de finaliser le move.
   try {
     const isPlaceholderName = (name) =>
@@ -297,7 +379,18 @@ container.addEventListener('drop', async (e) => {
       const moved = await window.api.fenceDragDropPaths?.(currentFenceId, fenceFilePaths);
       if (moved) {
         window.__interFenceDropHandled = true;
-        await loadFenceItems();
+        return;
+      }
+    }
+
+    if (internalPayload?.paths?.length && internalPayload.sourceFenceId) {
+      const moved = await window.api.fenceDragDropPaths?.(
+        currentFenceId,
+        internalPayload.paths
+      );
+      if (moved) {
+        window.__interFenceDropHandled = true;
+        try { window.api.shellDragEnded?.(); } catch {}
         return;
       }
     }
@@ -308,7 +401,6 @@ container.addEventListener('drop', async (e) => {
       window.__interFenceDropHandled = true;
       await window.api.fenceDragDrop?.(currentFenceId);
       try { window.api.shellDragEnded?.(); } catch {}
-      await loadFenceItems();
       return;
     }
   } catch {}
@@ -319,7 +411,8 @@ container.addEventListener('drop', async (e) => {
       try {
         if (f.path && f.path.trim() !== '') {
           const realName = f.path.split(/[\\/]/).pop() || f.name;
-          await window.api.moveToFence(currentFenceId, f.path, realName);
+          const result = await window.api.moveToFence(currentFenceId, f.path, realName);
+          handleMoveToFenceResult(result);
         } else {
           const buffer = await f.arrayBuffer();
           await window.api.writeBufferToFence(currentFenceId, f.name, buffer);
@@ -541,8 +634,14 @@ function applyStyle({ color, opacity }) {
 
 function applyIconSize(size) {
   document.documentElement.style.setProperty('--icon-size', size + 'px');
-  // Force reflow immédiat de la grille
-  container.style.gridTemplateColumns = `repeat(auto-fill, ${size + 16}px)`;
+  applyColWidth(currentColWidth);
+}
+
+function applyColWidth(colWidth) {
+  const minW = currentIconSize + 16;
+  const w = Math.max(minW, colWidth || minW);
+  document.documentElement.style.setProperty('--icon-col-width', w + 'px');
+  container.style.gridTemplateColumns = `repeat(auto-fill, ${w}px)`;
 }
 
 // ── Verrouillage de position ─────────────────────
@@ -724,19 +823,21 @@ async function sortItems(items) {
   return infos.map(i => i.path);
 }
 
-async function loadFenceItems() {
+async function loadFenceItems(opts = {}) {
   if (!currentFenceId) return;
+  const skipScrim = opts.soft === true || isInterFenceDragActive();
 
   // Éviter un "flash" vide (fenêtre translucide) pendant les awaits.
-  // Sinon, on voit les icônes du bureau derrière et ça ressemble à un renommage.
   let scrim = container.querySelector('.refresh-scrim');
-  if (!scrim) {
-    scrim = document.createElement('div');
-    scrim.className = 'refresh-scrim';
-    scrim.textContent = '...';
-    container.appendChild(scrim);
+  if (!skipScrim) {
+    if (!scrim) {
+      scrim = document.createElement('div');
+      scrim.className = 'refresh-scrim';
+      scrim.textContent = '...';
+      container.appendChild(scrim);
+    }
+    scrim.style.display = 'flex';
   }
-  scrim.style.display = 'flex';
 
   let items = await window.api.listFenceItems(currentFenceId);
   items = await sortItems(items);
@@ -746,7 +847,7 @@ async function loadFenceItems() {
     // Si on vient tout juste d'avoir des items, il s'agit souvent d'un état transitoire
     // pendant un move OLE -> re-tenter rapidement sans réduire la fenêtre.
     if (Date.now() - _lastNonEmptyAt < 1200) {
-      scrim.style.display = 'none';
+      if (scrim) scrim.style.display = 'none';
       setTimeout(() => { loadFenceItems(); }, 150);
       return;
     }
@@ -758,7 +859,7 @@ async function loadFenceItems() {
     const resizeBr = document.getElementById('resize-br');
     if (resizeBr) container.insertBefore(ph, resizeBr);
     else container.appendChild(ph);
-    scrim.style.display = 'none';
+    if (scrim) scrim.style.display = 'none';
     await autoResize();
     return;
   }
@@ -766,7 +867,7 @@ async function loadFenceItems() {
 
   // Supprimer uniquement les icônes et le placeholder, pas les poignées
   container.querySelectorAll('.icon, .empty-placeholder').forEach(el => el.remove());
-  scrim.style.display = 'none';
+  if (scrim) scrim.style.display = 'none';
 
   // Insérer les icônes AVANT les poignées de redimensionnement
   const resizeBottom = document.getElementById('resize-bottom');
@@ -777,6 +878,15 @@ async function loadFenceItems() {
 
   // Token anti-race: ignorer les chargements d'icônes d'un ancien rendu
   const renderToken = (window.__renderToken = (window.__renderToken ?? 0) + 1);
+
+  const itemStats = await Promise.all(items.map(async (p) => {
+    try {
+      const stat = await window.api.getFileStat(p);
+      return { path: p, isDirectory: !!stat?.isDirectory };
+    } catch {
+      return { path: p, isDirectory: false };
+    }
+  }));
 
   const loadIconAsync = async (fullPath, img, boxIconSize) => {
     try {
@@ -828,12 +938,14 @@ async function loadFenceItems() {
     } catch {}
   };
 
-  for (const fullPath of items) {
+  for (const { path: fullPath, isDirectory } of itemStats) {
     const div = document.createElement('div');
     div.className = 'icon';
+    if (isDirectory) div.classList.add('is-folder');
     div.dataset.fullPath = fullPath;
     const sz = currentIconSize;
-    div.style.width = (sz + 16) + 'px';
+    const cellW = Math.max(sz + 16, currentColWidth || sz + 16);
+    div.style.width = cellW + 'px';
 
     const img = document.createElement('img');
     img.style.width = sz + 'px';
@@ -852,24 +964,19 @@ async function loadFenceItems() {
     // Tooltip : nom de fichier complet avec extension (sans le chemin)
     div.title = fullPath.split(/[\\/]/).pop();
 
-    // Drag via HTML5 dragstart, puis lancement du drag OLE natif.
-    // (C'était l'état "rapide" qui fonctionnait.)
+    // Drag HTML5 + placeholder natif (modèle stable v3.4.48)
     div.draggable = true;
     div.addEventListener('dragstart', (e) => {
       try {
         if (e.dataTransfer) {
           e.dataTransfer.effectAllowed = 'move';
           e.dataTransfer.setData('text/plain', fullPath);
-          // Masquer le feedback HTML5 Chromium (badge "interdit" visuel).
-          // Le déplacement réel reste géré par la logique native/placeholder.
           try { e.dataTransfer.setDragImage(TRANSPARENT_DRAG_IMG, 0, 0); } catch {}
         }
 
         window.__interFenceDrag = true;
         div._dropHandled = false;
 
-        // Multi-sélection : si l'élément draggé fait partie de la sélection,
-        // on drag tous les sélectionnés ; sinon on sélectionne uniquement celui-ci
         if (selectedItems.has(fullPath) && selectedItems.size > 1) {
           dragSrcPaths = Array.from(selectedItems);
         } else {
@@ -878,7 +985,6 @@ async function loadFenceItems() {
         }
         dragSrcPath = fullPath;
 
-        // Marquer tous les éléments draggés
         container.querySelectorAll('.icon').forEach(el => {
           if (dragSrcPaths.includes(el.dataset.fullPath)) {
             el.classList.add('dragging');
@@ -888,10 +994,12 @@ async function loadFenceItems() {
 
         const pathsSnapshot = [...dragSrcPaths];
 
-        // Démarrer le drag "inter-box" côté main (état global)
-        window.api.fenceDragStart?.(pathsSnapshot, currentFenceId).catch(() => {});
+        try {
+          window.api.fenceDragStartSync?.(pathsSnapshot, currentFenceId);
+        } catch {
+          window.api.fenceDragStart?.(pathsSnapshot, currentFenceId).catch(() => {});
+        }
 
-        // Permettre un drop HTML5 entre fenêtres Boxes sans dépendre d'un DropTarget OLE
         if (e.dataTransfer) {
           try {
             e.dataTransfer.setData('application/x-boxes-internal', JSON.stringify({
@@ -911,95 +1019,33 @@ async function loadFenceItems() {
             try {
               effect = await window.api.startOleDrag?.(pathsSnapshot, currentFenceId);
             } catch {}
-            // Fallback instantané vers la version stable si OLE n'a pas démarré.
             if (!effect) {
               window.__oleDragSession = false;
-              window.api.nativeDragStart(pathsSnapshot, currentFenceId).catch(() => {});
+              try {
+                window.api.nativeDragStartSync?.(pathsSnapshot, currentFenceId);
+              } catch {
+                window.api.nativeDragStart(pathsSnapshot, currentFenceId).catch(() => {});
+              }
             }
           }, 0);
         } else {
-          // Chemin stable placeholder (version de secours)
           window.__oleDragSession = false;
-          window.api.nativeDragStart(pathsSnapshot, currentFenceId).catch(() => {});
+          try {
+            window.api.nativeDragStartSync?.(pathsSnapshot, currentFenceId);
+          } catch {
+            window.api.nativeDragStart(pathsSnapshot, currentFenceId).catch(() => {});
+          }
         }
       } catch {}
     });
 
-    // ── Drag OVER sur une icône (indicateur d'insertion avant/après)
-    div.addEventListener('dragover', (e) => {
-      const isInterFenceOrExternal = !dragSrcPath || !items.includes(dragSrcPath);
-      if (isInterFenceOrExternal) return;
-      e.preventDefault();
-      e.stopPropagation();
-      e.dataTransfer.dropEffect = 'move';
-      if (dragSrcPaths.includes(fullPath)) return;
-
-      // Effacer tous les indicateurs existants
-      container.querySelectorAll('.icon.insert-before, .icon.insert-after')
-        .forEach(el => { el.classList.remove('insert-before'); el.classList.remove('insert-after'); });
-
-      // Avant ou après selon la moitié horizontale de l'icône survolée
-      const rect = div.getBoundingClientRect();
-      const midX = rect.left + rect.width / 2;
-      if (e.clientX < midX) {
-        div.classList.add('insert-before');
-      } else {
-        div.classList.add('insert-after');
-      }
-    });
-
-    // ── Drop sur une icône (réorganisation interne)
-    div.addEventListener('drop', async (e) => {
-      // Ne capturer le drop QUE pour la réorganisation interne.
-      // Si c'est un drop externe (Explorer/Bureau), laisser l'événement remonter
-      // jusqu'au listener sur #container qui gère l'ajout de fichiers.
-      if (!dragSrcPath || !items.includes(dragSrcPath)) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-
-      // Lire la position (avant/après) AVANT de nettoyer les classes
-      const insertBefore = div.classList.contains('insert-before');
-      const insertAfter  = div.classList.contains('insert-after');
-
-      container.querySelectorAll('.icon.insert-before, .icon.insert-after')
-        .forEach(el => { el.classList.remove('insert-before'); el.classList.remove('insert-after'); });
-
-      if (dragSrcPaths.includes(fullPath)) return;
-
-      div._dropHandled = true;
-      container.querySelectorAll('.icon').forEach(el => { el._dropHandled = true; });
-
-      const currentOrder = Array.from(container.querySelectorAll('.icon')).map(el => el.dataset.fullPath);
-      const targets = dragSrcPaths;
-      const remaining = currentOrder.filter(p => !targets.includes(p));
-      let insertIdx = remaining.indexOf(fullPath);
-      if (insertIdx === -1) return;
-      if (insertAfter) insertIdx += 1; // insérer après
-      remaining.splice(insertIdx, 0, ...targets);
-
-      manualOrder = remaining.map(p => p.split(/[\\/]/).pop());
-      await window.api.setFenceOrder(currentFenceId, manualOrder);
-      await window.api.fenceDragCancel();
-      window.__interFenceDrag = false;
-      dragSrcPath = null;
-      dragSrcPaths = [];
-      await loadFenceItems();
-    });
-
-    div.addEventListener('dragleave', () => {
-      div.classList.remove('insert-before');
-      div.classList.remove('insert-after');
-    });
-
-    div.addEventListener('dragend', async (e) => {
+    div.addEventListener('dragend', async () => {
       try {
         container.querySelectorAll('.icon.dragging, .icon.drop-target').forEach(el => {
           el.classList.remove('dragging');
           el.classList.remove('drop-target');
         });
 
-        // Capturer l'état AVANT le reset
         const wentOutside = window.__interFenceDrag === true;
         const pathsSnapshot = wentOutside ? [...dragSrcPaths] : null;
 
@@ -1008,11 +1054,6 @@ async function loadFenceItems() {
         dragSrcPaths = [];
         div._dropHandled = false;
 
-        // Si le drag est sorti de la fenêtre, vérifier si le placeholder se trouve
-        // sur le bureau : c'est le signal fiable que le drop a eu lieu sur le bureau.
-        // Le placeholder est déplacé par Windows de %TEMP% vers le bureau lors du dépôt.
-        // Ici, on utilise placeholder pour le drag: si le placeholder est sur le bureau,
-        // on déplace les vrais fichiers vers le bureau.
         if (window.__oleDragSession) {
           window.__oleDragSession = false;
           return;
@@ -1024,9 +1065,6 @@ async function loadFenceItems() {
             return;
           }
 
-          // Contournement bureau : si le curseur est sur le bureau au relâchement,
-          // déplacer directement les fichiers vers Desktop.
-          // (évite le blocage "sens interdit" de certains environnements Windows)
           try {
             const cls = window.api.getWindowClassUnderCursor?.();
             const onDesktop =
@@ -1065,8 +1103,110 @@ async function loadFenceItems() {
             try { window.api.shellDragEnded?.(); } catch {}
           }
         }
-      } catch (err) {
+      } catch {}
+    });
+
+    div.addEventListener('dragover', (e) => {
+    // ── Drag OVER sur une icône (insertion ou dépôt dans un dossier)
+      const isInternal = dragSrcPath && items.includes(dragSrcPath);
+      if (isDirectory && isInternal && !dragSrcPaths.includes(fullPath)) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'move';
+        container.querySelectorAll('.icon.insert-before, .icon.insert-after, .icon.drop-into-folder')
+          .forEach(el => {
+            el.classList.remove('insert-before');
+            el.classList.remove('insert-after');
+            el.classList.remove('drop-into-folder');
+          });
+        div.classList.add('drop-into-folder');
+        return;
       }
+
+      const isInterFenceOrExternal = !dragSrcPath || !items.includes(dragSrcPath);
+      if (isInterFenceOrExternal) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = 'move';
+      if (dragSrcPaths.includes(fullPath)) return;
+
+      container.querySelectorAll('.icon.insert-before, .icon.insert-after, .icon.drop-into-folder')
+        .forEach(el => {
+          el.classList.remove('insert-before');
+          el.classList.remove('insert-after');
+          el.classList.remove('drop-into-folder');
+        });
+
+      const rect = div.getBoundingClientRect();
+      const midX = rect.left + rect.width / 2;
+      if (e.clientX < midX) {
+        div.classList.add('insert-before');
+      } else {
+        div.classList.add('insert-after');
+      }
+    });
+
+    // ── Drop sur une icône (dossier ou réorganisation interne)
+    div.addEventListener('drop', async (e) => {
+      const isInternal = dragSrcPath && items.includes(dragSrcPath);
+
+      if (isDirectory && isInternal && !dragSrcPaths.includes(fullPath)) {
+        e.preventDefault();
+        e.stopPropagation();
+        div.classList.remove('drop-into-folder');
+        if (!dragSrcPaths.length) return;
+
+        await window.api.moveItemsIntoFolder(dragSrcPaths, fullPath);
+        await window.api.fenceDragCancel();
+        window.__interFenceDrag = false;
+        dragSrcPath = null;
+        dragSrcPaths = [];
+        _lastNonEmptyAt = 0;
+        await loadFenceItems();
+        return;
+      }
+
+      if (!isInternal) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      // Lire la position (avant/après) AVANT de nettoyer les classes
+      const insertBefore = div.classList.contains('insert-before');
+      const insertAfter  = div.classList.contains('insert-after');
+
+      container.querySelectorAll('.icon.insert-before, .icon.insert-after')
+        .forEach(el => { el.classList.remove('insert-before'); el.classList.remove('insert-after'); });
+
+      if (dragSrcPaths.includes(fullPath)) {
+        window.__interFenceDropHandled = true;
+        return;
+      }
+
+      div._dropHandled = true;
+      container.querySelectorAll('.icon').forEach(el => { el._dropHandled = true; });
+
+      const currentOrder = Array.from(container.querySelectorAll('.icon')).map(el => el.dataset.fullPath);
+      const targets = dragSrcPaths;
+      const remaining = currentOrder.filter(p => !targets.includes(p));
+      let insertIdx = remaining.indexOf(fullPath);
+      if (insertIdx === -1) return;
+      if (insertAfter) insertIdx += 1; // insérer après
+      remaining.splice(insertIdx, 0, ...targets);
+
+      manualOrder = remaining.map(p => p.split(/[\\/]/).pop());
+      await window.api.setFenceOrder(currentFenceId, manualOrder);
+      await window.api.fenceDragCancel();
+      window.__interFenceDrag = false;
+      dragSrcPath = null;
+      dragSrcPaths = [];
+      await loadFenceItems();
+    });
+
+    div.addEventListener('dragleave', () => {
+      div.classList.remove('insert-before');
+      div.classList.remove('insert-after');
+      div.classList.remove('drop-into-folder');
     });
 
     div.addEventListener('click', (e) => {

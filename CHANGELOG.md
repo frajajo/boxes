@@ -1,5 +1,35 @@
 # Changelog
 
+## 3.8.0
+
+### Stockage bureau (mode Stardock)
+- Fichiers des boxes dans **`Bureau\Boxes\<NomDeLaBox>\`** (migration automatique depuis AppData).
+- Dossier `Boxes` **masqué dans l'Explorateur** (Hidden + System).
+- **Masquer les icônes Windows** : toggle dans le panneau Apparence (restauré à la fermeture).
+- **Auto-organisation** : originaux du bureau rangés dans un sous-dossier au nom de la box.
+
+### Drag & drop
+- **Inter-box** : glisser une icône d'une box vers une autre (modèle placeholder stable).
+- **Bureau ↔ box** : déplacement quand Windows l'autorise ; copie seule pour le bureau public (EPERM).
+- **Dépôt dans un dossier** à l'intérieur d'une box.
+- Démarrage drag **synchrone** (`fenceDragStartSync`, `nativeDragStartSync`) pour fiabilité.
+- DropTarget OLE **opt-in** (`test.bat ole` / `--native-dnd`) — désactivé par défaut.
+- Rafraîchissement UI **sans clignotement** pendant le drag inter-box.
+
+### Module natif (`shell_utils`)
+- DropTarget OLE, drag placeholder, masquage icônes bureau ListView.
+- Notifications Shell après déplacements.
+
+### Interface & outils
+- Panneau Apparence : toggles masquage icônes, auto-organisation.
+- Style « glass » modernisé.
+- **`test.bat`** : dev (`rebuild`, `legacy`, `ole`), **`build.ps1`**, **`scripts/publish-itch.ps1`**.
+
+### Retraits
+- Aperçu temporaire icônes bureau (double-clic / Ctrl+Shift+D) — instable, retiré.
+
+---
+
 ## 3.4.48
 
 ### Apparence

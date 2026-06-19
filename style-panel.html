@@ -36,6 +36,12 @@
       <input type="range" class="opacity-slider" min="0.1" max="1" step="0.05" />
     </div>
 
+    <div class="style-row">
+      <label>Colonne collection <span class="col-width-val"></span></label>
+      <input type="range" class="col-width-slider" min="64" max="280" step="4" />
+      <div class="style-panel-hint">Largeur horizontale des cellules d'icônes (noms longs, favoris…)</div>
+    </div>
+
     <div class="style-row" style="margin-bottom:4px">
       <label class="style-toggle-row">
         <span>Afficher les extensions</span>
@@ -54,7 +60,18 @@
           <span class="ext-toggle-track"><span class="ext-toggle-thumb"></span></span>
         </span>
       </label>
-      <div class="style-panel-hint">Déplace les originaux du bureau dans un dossier du nom de la box</div>
+      <div class="style-panel-hint">Déplace les originaux du bureau dans un dossier du nom de la box (mode AppData)</div>
+    </div>
+
+    <div class="style-row" style="margin-bottom:4px">
+      <label class="style-toggle-row">
+        <span>Masquer les icônes Windows</span>
+        <span class="ext-toggle-wrap">
+          <input type="checkbox" class="ext-toggle-input ext-toggle hide-desktop-icons-input" />
+          <span class="ext-toggle-track"><span class="ext-toggle-thumb"></span></span>
+        </span>
+      </label>
+      <div class="style-panel-hint">Comme Stardock Fences : le bureau n'affiche que vos boxes (restauré à la fermeture)</div>
     </div>
   </div>
   <script src="style-panel-renderer.js"></script>

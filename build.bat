@@ -24,6 +24,7 @@ if /I "%~2"=="nolaunch" set "LAUNCH=0"
 set "RUN_MODE=nsis"
 if /I "%MODE%"=="portable" goto do_portable
 if /I "%MODE%"=="rebuild" goto do_rebuild
+if /I "%MODE%"=="itch" goto do_itch
 if /I "%MODE%"=="installateur" goto do_installateur
 if /I "%MODE%"=="help" goto help
 if /I "%MODE%"=="/?" goto help
@@ -57,6 +58,15 @@ echo.
 call npm run rebuild:clean
 goto check_result
 
+:do_itch
+echo Mode : publication itch.io
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\publish-itch.ps1
+if errorlevel 1 goto fail
+echo.
+pause
+exit /b 0
+
 :check_result
 if errorlevel 1 goto fail
 
@@ -87,11 +97,13 @@ exit /b 0
 :help
 echo.
 echo Usage : build.bat [mode] [nolaunch]
+echo          PowerShell : .\build.bat [mode]   ou   .\build.ps1 [mode]
 echo.
 echo   build.bat                 Installateur NSIS + lancement auto
 echo   build.bat installateur    Idem
 echo   build.bat portable        Executable portable + lancement auto
 echo   build.bat rebuild         Rebuild modules natifs + installateur + lancement
+echo   build.bat itch            Publier sur itch.io (cle API requise)
 echo   build.bat nolaunch        Build sans lancer Boxes a la fin
 echo   build.bat installateur nolaunch
 echo   build.bat help            Affiche cette aide

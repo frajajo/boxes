@@ -4,6 +4,8 @@ build
 build-*
 _asar-check
 .cursorignore
+tools/butler
+build/itch-upload-*
 rcedit.exe
 screenshots
 .claude

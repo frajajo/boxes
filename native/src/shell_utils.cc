@@ -15,6 +15,11 @@
 #include <thread>
 #include <sstream>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <winreg.h>
+#include <thread>
+#include <atomic>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -530,7 +535,13 @@ public:
     } else {
       payload.kind = "files";
       payload.files = ReadHDrop(pDataObj);
-      *pdwEffect = payload.files.empty() ? DROPEFFECT_NONE : DROPEFFECT_COPY;
+      bool placeholder = false;
+      for (const auto& f : payload.files) {
+        if (IsBoxesPlaceholderPath(f)) { placeholder = true; break; }
+      }
+      *pdwEffect = payload.files.empty()
+        ? DROPEFFECT_NONE
+        : (placeholder ? DROPEFFECT_MOVE : DROPEFFECT_COPY);
     }
 
     // Notifier JS (main) pour qu'il exécute move/copy + refresh UI
@@ -552,11 +563,23 @@ public:
   }
 
 private:
+  static bool IsBoxesPlaceholderPath(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    const std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    if (name.size() >= 10 && name.rfind("boxes-drag-", 0) == 0) return true;
+    return _stricmp(name.c_str(), "boxes-drag-placeholder.tmp") == 0;
+  }
+
   DWORD QueryEffect(IDataObject* pDataObj) {
     if (!pDataObj) return DROPEFFECT_NONE;
     if (HasInternal(pDataObj)) return DROPEFFECT_MOVE;
     FORMATETC fe = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
-    return (pDataObj->QueryGetData(&fe) == S_OK) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    if (pDataObj->QueryGetData(&fe) != S_OK) return DROPEFFECT_NONE;
+    const auto files = ReadHDrop(pDataObj);
+    for (const auto& f : files) {
+      if (IsBoxesPlaceholderPath(f)) return DROPEFFECT_MOVE;
+    }
+    return DROPEFFECT_COPY;
   }
 
   bool HasInternal(IDataObject* pDataObj) {
@@ -938,6 +961,310 @@ Napi::Value GetFileIconPng(const Napi::CallbackInfo& info) {
   return result;
 }
 
+// ── Bureau Windows : masquer / afficher les icônes (ListView Explorer) ───────
+
+static BOOL CALLBACK EnumChildFindDesktopListView(HWND hwnd, LPARAM lp) {
+  wchar_t cls[64] = {};
+  if (GetClassNameW(hwnd, cls, 63) <= 0) return TRUE;
+  if (wcscmp(cls, L"SysListView32") != 0) return TRUE;
+  HWND parent = GetParent(hwnd);
+  if (!parent) return TRUE;
+  wchar_t pcls[64] = {};
+  if (GetClassNameW(parent, pcls, 63) <= 0) return TRUE;
+  if (wcscmp(pcls, L"SHELLDLL_DefView") == 0) {
+    *(HWND*)lp = hwnd;
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static BOOL CALLBACK EnumTopLevelFindDesktopListView(HWND hwnd, LPARAM lp) {
+  wchar_t cls[64] = {};
+  if (GetClassNameW(hwnd, cls, 63) <= 0) return TRUE;
+  if (wcscmp(cls, L"Progman") != 0 && wcscmp(cls, L"WorkerW") != 0) return TRUE;
+  if (!EnumChildWindows(hwnd, EnumChildFindDesktopListView, lp)) return FALSE;
+  return *(HWND*)lp ? FALSE : TRUE;
+}
+
+static HWND FindDesktopListViewHwnd() {
+  HWND progman = FindWindowW(L"Progman", nullptr);
+  if (progman) {
+    DWORD_PTR sendResult = 0;
+    SendMessageTimeoutW(progman, 0x052C, 0, 0, SMTO_ABORTIFHUNG, 1000, &sendResult);
+  }
+  HWND lv = nullptr;
+  EnumWindows(EnumTopLevelFindDesktopListView, (LPARAM)&lv);
+  return lv;
+}
+
+static bool SetDesktopIconsHideRegistry(bool hide) {
+  HKEY hKey = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER,
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+    return false;
+  }
+  const DWORD val = hide ? 1u : 0u;
+  const LSTATUS st = RegSetValueExW(hKey, L"HideIcons", 0, REG_DWORD,
+    reinterpret_cast<const BYTE*>(&val), sizeof(val));
+  RegCloseKey(hKey);
+  if (st != ERROR_SUCCESS) return false;
+  SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+  return true;
+}
+
+Napi::Value SetDesktopIconsVisible(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 1 || !info[0].IsBoolean()) {
+    return Napi::Boolean::New(env, false);
+  }
+  const bool visible = info[0].As<Napi::Boolean>().Value();
+  bool ok = false;
+  HWND lv = FindDesktopListViewHwnd();
+  if (lv) {
+    ShowWindow(lv, visible ? SW_SHOW : SW_HIDE);
+    InvalidateRect(lv, nullptr, TRUE);
+    UpdateWindow(lv);
+    ok = true;
+  }
+  if (!ok) {
+    ok = SetDesktopIconsHideRegistry(!visible);
+  }
+  return Napi::Boolean::New(env, ok);
+}
+
+// ── Double-clic bureau : apercu temporaire des icones (style Stardock) ───────
+// Hook souris global sur un thread dedie (message loop Windows requis).
+
+static HHOOK g_mouseLlHook = nullptr;
+static Napi::ThreadSafeFunction* g_desktopPeekTsfn = nullptr;
+static std::thread g_peekHookThread;
+static std::atomic<bool> g_peekHookStop{false};
+static std::atomic<DWORD> g_peekHookThreadId{0};
+static std::atomic<bool> g_desktopDblClickPending{false};
+static DWORD g_lastDesktopDownTime = 0;
+static POINT g_lastDesktopDownPt = {0, 0};
+
+static void FireDesktopPeekCallback() {
+  if (!g_desktopPeekTsfn) return;
+  g_desktopPeekTsfn->NonBlockingCall([](Napi::Env env, Napi::Function cb) {
+    cb.Call({});
+  });
+}
+
+static HMODULE GetAddonModuleHandle() {
+  HMODULE hm = nullptr;
+  GetModuleHandleExW(
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    reinterpret_cast<LPCWSTR>(&FireDesktopPeekCallback),
+    &hm);
+  return hm;
+}
+
+static bool IsDesktopShellClass(const wchar_t* cls) {
+  return wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0 ||
+         wcscmp(cls, L"SHELLDLL_DefView") == 0 || wcscmp(cls, L"SysListView32") == 0 ||
+         wcscmp(cls, L"DirectUIHWND") == 0 || wcscmp(cls, L"FolderView") == 0;
+}
+
+static bool IsPointOnDesktop(POINT pt) {
+  HWND hwnd = WindowFromPoint(pt);
+  for (int depth = 0; depth < 16 && hwnd; depth++) {
+    wchar_t cls[256] = {};
+    if (GetClassNameW(hwnd, cls, 255) > 0) {
+      if (wcscmp(cls, L"Chrome_RenderWidgetHostHWND") == 0 ||
+          wcscmp(cls, L"Chrome_WidgetWin_1") == 0) {
+        return false;
+      }
+      if (IsDesktopShellClass(cls)) return true;
+    }
+    hwnd = GetParent(hwnd);
+  }
+  HWND root = GetAncestor(WindowFromPoint(pt), GA_ROOT);
+  if (root) {
+    wchar_t cls[256] = {};
+    if (GetClassNameW(root, cls, 255) > 0 && IsDesktopShellClass(cls)) return true;
+  }
+  return false;
+}
+
+static void SignalDesktopDoubleClick() {
+  g_desktopDblClickPending.store(true);
+  FireDesktopPeekCallback();
+}
+
+static void HandleDesktopMouseDown(const MSLLHOOKSTRUCT* ms) {
+  const DWORD now = ms->time;
+  const int dx = abs(ms->pt.x - g_lastDesktopDownPt.x);
+  const int dy = abs(ms->pt.y - g_lastDesktopDownPt.y);
+  const DWORD dblTime = static_cast<DWORD>(GetDoubleClickTime());
+  const int dxLimit = GetSystemMetrics(SM_CXDOUBLECLK);
+  const int dyLimit = GetSystemMetrics(SM_CYDOUBLECLK);
+
+  if (g_lastDesktopDownTime != 0 &&
+      (now - g_lastDesktopDownTime) <= dblTime &&
+      dx <= dxLimit && dy <= dyLimit) {
+    g_lastDesktopDownTime = 0;
+    SignalDesktopDoubleClick();
+    return;
+  }
+
+  g_lastDesktopDownTime = now;
+  g_lastDesktopDownPt = ms->pt;
+}
+
+static LRESULT CALLBACK DesktopPeekMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+  if (nCode == HC_ACTION && g_desktopPeekTsfn) {
+    auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+    if (ms) {
+      if (wParam == WM_LBUTTONDOWN) {
+        HandleDesktopMouseDown(ms);
+      } else if (wParam == WM_LBUTTONDBLCLK) {
+        g_lastDesktopDownTime = 0;
+        SignalDesktopDoubleClick();
+      }
+    }
+  }
+  return CallNextHookEx(g_mouseLlHook, nCode, wParam, lParam);
+}
+
+static void ReleaseDesktopPeekHookUnlocked() {
+  if (g_mouseLlHook) {
+    UnhookWindowsHookEx(g_mouseLlHook);
+    g_mouseLlHook = nullptr;
+  }
+  if (g_desktopPeekTsfn) {
+    g_desktopPeekTsfn->Release();
+    delete g_desktopPeekTsfn;
+    g_desktopPeekTsfn = nullptr;
+  }
+}
+
+static void PeekHookThreadMain() {
+  g_peekHookThreadId.store(GetCurrentThreadId());
+  HMODULE hMod = GetAddonModuleHandle();
+  if (!hMod) hMod = GetModuleHandleW(nullptr);
+  g_mouseLlHook = SetWindowsHookExW(WH_MOUSE_LL, DesktopPeekMouseProc, hMod, 0);
+
+  MSG msg;
+  while (!g_peekHookStop.load()) {
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) {
+        g_peekHookStop.store(true);
+        break;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    if (g_peekHookStop.load()) break;
+    WaitMessage();
+  }
+  ReleaseDesktopPeekHookUnlocked();
+  g_peekHookThreadId.store(0);
+}
+
+static void ReleaseDesktopPeekHook() {
+  g_peekHookStop.store(true);
+  const DWORD tid = g_peekHookThreadId.load();
+  if (tid) PostThreadMessageW(tid, WM_QUIT, 0, 0);
+  if (g_peekHookThread.joinable()) {
+    g_peekHookThread.join();
+  }
+  g_peekHookThread = std::thread();
+  g_peekHookStop.store(false);
+  ReleaseDesktopPeekHookUnlocked();
+}
+
+Napi::Value RegisterDesktopPeekHook(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 1 || !info[0].IsFunction()) {
+    return Napi::Boolean::New(env, false);
+  }
+  ReleaseDesktopPeekHook();
+  g_desktopPeekTsfn = new Napi::ThreadSafeFunction(
+    Napi::ThreadSafeFunction::New(env, info[0].As<Napi::Function>(), "DesktopPeek", 0, 1));
+
+  g_peekHookStop.store(false);
+  g_peekHookThread = std::thread(PeekHookThreadMain);
+
+  // Laisser le thread installer le hook
+  for (int i = 0; i < 30 && !g_mouseLlHook; i++) {
+    Sleep(10);
+  }
+  return Napi::Boolean::New(env, g_mouseLlHook != nullptr);
+}
+
+Napi::Value UnregisterDesktopPeekHook(const Napi::CallbackInfo& info) {
+  ReleaseDesktopPeekHook();
+  return Napi::Boolean::New(info.Env(), true);
+}
+
+Napi::Value ConsumeDesktopDoubleClick(const Napi::CallbackInfo& info) {
+  const bool pending = g_desktopDblClickPending.exchange(false);
+  return Napi::Boolean::New(info.Env(), pending);
+}
+
+// Détection double-clic via polling (main process) — plus fiable que le hook seul.
+Napi::Value PollDesktopDoubleClick(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  static bool prevDown = false;
+  static ULONGLONG lastClickTick = 0;
+  static POINT lastPt = {0, 0};
+
+  const SHORT st = GetAsyncKeyState(VK_LBUTTON);
+  const bool down = (st & 0x8000) != 0;
+  bool detected = false;
+
+  if (down && !prevDown) {
+    POINT pt = {};
+    GetCursorPos(&pt);
+    const ULONGLONG now = GetTickCount64();
+    const DWORD dblTime = static_cast<DWORD>(GetDoubleClickTime());
+    const int dxLimit = GetSystemMetrics(SM_CXDOUBLECLK);
+    const int dyLimit = GetSystemMetrics(SM_CYDOUBLECLK);
+    const int dx = abs(pt.x - lastPt.x);
+    const int dy = abs(pt.y - lastPt.y);
+
+    if (lastClickTick != 0 &&
+        (now - lastClickTick) <= dblTime &&
+        dx <= dxLimit && dy <= dyLimit) {
+      detected = true;
+      g_desktopDblClickPending.store(true);
+      lastClickTick = 0;
+    } else {
+      lastClickTick = now;
+      lastPt = pt;
+    }
+  }
+  prevDown = down;
+  return Napi::Boolean::New(env, detected);
+}
+
+Napi::Value IsLeftMouseButtonDown(const Napi::CallbackInfo& info) {
+  const bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+  return Napi::Boolean::New(info.Env(), down);
+}
+
+static Napi::Buffer<uint8_t> HwndToBuffer(Napi::Env env, HWND hwnd) {
+  void* p = hwnd;
+  return Napi::Buffer<uint8_t>::Copy(env, reinterpret_cast<uint8_t*>(&p), sizeof(void*));
+}
+
+Napi::Value GetRootHwndAtPoint(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+    return env.Null();
+  }
+  const LONG x = static_cast<LONG>(info[0].As<Napi::Number>().Int32Value());
+  const LONG y = static_cast<LONG>(info[1].As<Napi::Number>().Int32Value());
+  POINT pt = { x, y };
+  HWND hwnd = WindowFromPoint(pt);
+  if (!hwnd) return env.Null();
+  HWND root = GetAncestor(hwnd, GA_ROOT);
+  if (!root) root = hwnd;
+  return HwndToBuffer(env, root);
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -952,6 +1279,13 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("getWindowClassUnderCursor", Napi::Function::New(env, GetWindowClassUnderCursor));
   exports.Set("registerDropTarget", Napi::Function::New(env, RegisterDropTarget));
   exports.Set("revokeDropTarget",   Napi::Function::New(env, RevokeDropTarget));
+  exports.Set("setDesktopIconsVisible", Napi::Function::New(env, SetDesktopIconsVisible));
+  exports.Set("registerDesktopPeekHook", Napi::Function::New(env, RegisterDesktopPeekHook));
+  exports.Set("unregisterDesktopPeekHook", Napi::Function::New(env, UnregisterDesktopPeekHook));
+  exports.Set("consumeDesktopDoubleClick", Napi::Function::New(env, ConsumeDesktopDoubleClick));
+  exports.Set("pollDesktopDoubleClick", Napi::Function::New(env, PollDesktopDoubleClick));
+  exports.Set("isLeftMouseButtonDown", Napi::Function::New(env, IsLeftMouseButtonDown));
+  exports.Set("getRootHwndAtPoint", Napi::Function::New(env, GetRootHwndAtPoint));
   return exports;
 }
 
