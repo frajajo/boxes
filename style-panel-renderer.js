@@ -3,6 +3,8 @@ let currentStyle = { color: '#1e1e1e', opacity: 0.6 };
 
 const opacitySlider = document.querySelector('.opacity-slider');
 const opacityVal = document.querySelector('.opacity-val');
+const colWidthSlider = document.querySelector('.col-width-slider');
+const colWidthVal = document.querySelector('.col-width-val');
 const colorCustom = document.querySelector('.color-custom');
 const closeBtn = document.querySelector('.style-panel-close');
 
@@ -41,6 +43,15 @@ opacitySlider.addEventListener('input', async () => {
   await saveStyle();
 });
 
+let colWidthDebounce = null;
+colWidthSlider.addEventListener('input', () => {
+  colWidthVal.textContent = colWidthSlider.value + ' px';
+  clearTimeout(colWidthDebounce);
+  colWidthDebounce = setTimeout(async () => {
+    await window.api.setFenceColWidth(currentFenceId, parseInt(colWidthSlider.value, 10));
+  }, 80);
+});
+
 const extToggle = document.querySelector('.ext-toggle:not(.auto-organize-input)');
 extToggle.addEventListener('change', async () => {
   await window.api.setFenceShowExtensions(currentFenceId, extToggle.checked);
@@ -49,6 +60,11 @@ extToggle.addEventListener('change', async () => {
 const autoOrganizeToggle = document.querySelector('.auto-organize-input');
 autoOrganizeToggle.addEventListener('change', async () => {
   await window.api.setAutoOrganizeDesktop(autoOrganizeToggle.checked);
+});
+
+const hideDesktopIconsToggle = document.querySelector('.hide-desktop-icons-input');
+hideDesktopIconsToggle.addEventListener('change', async () => {
+  await window.api.setHideWindowsDesktopIcons(hideDesktopIconsToggle.checked);
 });
 
 closeBtn.addEventListener('click', closePanel);
@@ -73,4 +89,13 @@ document.addEventListener('keydown', (e) => {
   }
 
   autoOrganizeToggle.checked = await window.api.getAutoOrganizeDesktop();
+  hideDesktopIconsToggle.checked = await window.api.getHideWindowsDesktopIcons();
+
+  const iconSize = fenceInfo?.iconSize ?? 48;
+  const defaultCol = fenceInfo?.colWidth ?? iconSize + 16;
+  const minCol = iconSize + 16;
+  colWidthSlider.min = String(minCol);
+  colWidthSlider.max = '280';
+  colWidthSlider.value = String(Math.max(minCol, defaultCol));
+  colWidthVal.textContent = colWidthSlider.value + ' px';
 })();

@@ -27,15 +27,23 @@ const apiCommon = {
   // Version de l'application
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
-  // Drag natif placeholder (async)
+  // Drag natif placeholder — sync obligatoire dans dragstart (~5 ms Chromium)
   nativeDragStart: (filePaths, fenceId) =>
     ipcRenderer.invoke('native-drag-start', { filePaths, fenceId }),
+  nativeDragStartSync: (filePaths, fenceId) => {
+    try {
+      return ipcRenderer.sendSync('native-drag-start-sync', { filePaths, fenceId });
+    } catch {
+      return false;
+    }
+  },
 
   // Win32: classe de la fenêtre sous le curseur (pour choisir la stratégie de drag)
   getWindowClassUnderCursor: () => {
     try { return shellUtils?.getWindowClassUnderCursor?.() ?? null; } catch { return null; }
   },
   hasNativeFileDrag: () => !!shellUtils?.startFileDrag,
+  isNativeDnDEnabled: () => ipcRenderer.invoke('get-native-dnd-enabled'),
 
   // Paramètres fence (utiles aussi dans le manager)
   setFenceIconSize: (fenceId, iconSize) =>
@@ -99,6 +107,13 @@ const apiFence = {
   // Drag & drop inter-fences
   fenceDragStart: (filePaths, fenceId) =>
     ipcRenderer.invoke('fence-drag-start', { filePaths, fenceId }),
+  fenceDragStartSync: (filePaths, fenceId) => {
+    try {
+      return ipcRenderer.sendSync('fence-drag-start-sync', { filePaths, fenceId });
+    } catch {
+      return false;
+    }
+  },
   fenceDragDrop: (targetFenceId) =>
     ipcRenderer.invoke('fence-drag-drop', { targetFenceId }),
   fenceDragDropPaths: (targetFenceId, filePaths) =>
@@ -126,6 +141,23 @@ const apiFence = {
       _oleDragBusy = false;
     }
   },
+  startOleDragSync: (filePaths, sourceFenceId) => {
+    const paths = Array.isArray(filePaths) ? filePaths : [filePaths];
+    if (!shellUtils?.startFileDrag) return 0;
+    if (_oleDragBusy) return 0;
+    _oleDragBusy = true;
+    try { ipcRenderer.send('shell-drag-started'); } catch {}
+    const internal = [String(sourceFenceId || ''), ...paths].join('\n');
+    try {
+      const effect = shellUtils.startFileDrag(paths, internal) || 0;
+      try { ipcRenderer.send('ole-drag-completed', sourceFenceId || null); } catch {}
+      return effect;
+    } catch {
+      return 0;
+    } finally {
+      _oleDragBusy = false;
+    }
+  },
 
   // Extraire un fichier vers le bureau (copie ou déplacement)
   extractToDesktop: (filePath, move) => ipcRenderer.invoke('extract-to-desktop', { filePath, move }),
@@ -135,6 +167,8 @@ const apiFence = {
   setAutoOrganizeDesktop: (enable) => ipcRenderer.invoke('set-auto-organize-desktop', enable),
   moveOriginalToBoxFolder: (srcFullPath, fenceId) =>
     ipcRenderer.invoke('move-original-to-box-folder', { srcFullPath, fenceId }),
+  moveItemsIntoFolder: (itemPaths, folderPath) =>
+    ipcRenderer.invoke('move-items-into-folder', { itemPaths, folderPath }),
 
   // Écrire un buffer brut dans la fence
   writeBufferToFence: (fenceId, destName, buffer) =>
@@ -143,6 +177,9 @@ const apiFence = {
   // Events
   onFenceRefresh: (cb) => ipcRenderer.on('fence-refresh', cb),
   onIconSizeChanged: (cb) => ipcRenderer.on('icon-size-changed', (_evt, size) => cb(size)),
+  setFenceColWidth: (fenceId, colWidth) =>
+    ipcRenderer.invoke('set-fence-col-width', { fenceId, colWidth }),
+  onColWidthChanged: (cb) => ipcRenderer.on('col-width-changed', (_evt, width) => cb(width)),
   setFenceShowExtensions: (fenceId, showExtensions) =>
     ipcRenderer.invoke('set-fence-show-extensions', { fenceId, showExtensions }),
   onShowExtensionsChanged: (cb) => ipcRenderer.on('show-extensions-changed', (_evt, val) => cb(val)),
@@ -154,6 +191,10 @@ const apiFence = {
   cleanupDragPlaceholder: (names) =>
     ipcRenderer.send('cleanup-drag-placeholder', names?.length ? { names } : undefined),
   shellDragEnded: () => ipcRenderer.send('shell-drag-ended'),
+  onInterFenceDragPhase: (cb) =>
+    ipcRenderer.on('inter-fence-drag-phase', (_evt, active) => cb(!!active)),
+  onNativeDragEnded: (cb) =>
+    ipcRenderer.on('native-drag-ended', () => cb()),
   moveWindow: (dx, dy) => ipcRenderer.send('move-window', dx, dy),
   setContentHeight: (height) => ipcRenderer.send('set-content-height', height),
   restoreLockedBounds: () => ipcRenderer.send('restore-locked-bounds'),
@@ -181,6 +222,10 @@ const apiStylePanel = {
     ipcRenderer.invoke('set-fence-show-extensions', { fenceId, showExtensions }),
   getAutoOrganizeDesktop: () => ipcRenderer.invoke('get-auto-organize-desktop'),
   setAutoOrganizeDesktop: (enable) => ipcRenderer.invoke('set-auto-organize-desktop', enable),
+  getHideWindowsDesktopIcons: () => ipcRenderer.invoke('get-hide-windows-desktop-icons'),
+  setHideWindowsDesktopIcons: (enable) => ipcRenderer.invoke('set-hide-windows-desktop-icons', enable),
+  setFenceColWidth: (fenceId, colWidth) =>
+    ipcRenderer.invoke('set-fence-col-width', { fenceId, colWidth }),
   closeStylePanel: () => ipcRenderer.invoke('close-style-panel'),
 };
 

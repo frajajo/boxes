@@ -365,6 +365,17 @@ const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 // ⚠️ Doit être appelé AVANT tout app.getPath('userData')
 app.setPath('userData', path.join(app.getPath('appData'), 'Boxes'));
+// Cache Chromium dédié (évite les conflits « Unable to move the cache » au redémarrage rapide)
+try {
+  const chromiumCacheDir = path.join(app.getPath('userData'), 'chromium-cache');
+  const gpuCacheDir = path.join(app.getPath('userData'), 'gpu-shader-cache');
+  fs.mkdirSync(chromiumCacheDir, { recursive: true });
+  fs.mkdirSync(gpuCacheDir, { recursive: true });
+  app.commandLine.appendSwitch('disk-cache-dir', chromiumCacheDir);
+  app.commandLine.appendSwitch('gpu-shader-disk-cache-dir', gpuCacheDir);
+} catch (e) {
+  console.warn('[cache] init cache dirs failed', e.message);
+}
 // Nécessaire pour que Windows associe la bonne icône dans la barre des tâches
 app.setAppUserModelId('com.francoisfalik.boxes');
 
@@ -632,15 +643,20 @@ async function getPdfThumbnail(filePath) {
 // ─────────────────────────────────────────────
 // Dossiers et états globaux
 // ─────────────────────────────────────────────
-const FENCES_BASE_DIR = path.join(app.getPath("userData"), "fences");
+const LEGACY_FENCES_BASE_DIR = path.join(app.getPath("userData"), "fences");
+/** Alias historique — préférer getFenceStorageDir() */
+const FENCES_BASE_DIR = LEGACY_FENCES_BASE_DIR;
+const DESKTOP_BOXES_DIRNAME = "Boxes";
+const FENCE_MARKER_FILE = ".boxes-fence-id";
 const CONFIG_PATH = path.join(app.getPath("userData"), "config.json");
 const TITLE_HEIGHT = 32; // hauteur de la barre de titre (28px + bordures)
 const FENCE_MIN_W = 160;  // largeur minimale d'une fence
 const STYLE_PANEL_W = 260;
-const STYLE_PANEL_H = 360;
+const STYLE_PANEL_H = 500;
 
 // États
 const openFences = new Map();
+const fenceDirWatchers = new Map(); // fenceId -> { fenceWatcher, desktopWatcher, debounceTimer }
 const stylePanelWindows = new Map(); // fenceId -> { panelWin, parentWin, onParentMove, onParentResize, onParentClose }
 let managerWin = null;
 let draggedItem = null;
@@ -655,7 +671,28 @@ let _lastInterFenceDropKey = '';
 let _lastInterFenceDropAt = 0;
 let _desktopDropFinalized = false;
 let _desktopDropFinalizing = false;
-const ENABLE_STARDOCK_DND_EXPERIMENT = process.argv.includes('--stardock-dnd-experiment');
+/** DropTarget OLE entrant — opt-in (--native-dnd / --stardock-dnd-experiment) */
+function shouldUseOleDropTarget() {
+  if (process.argv.includes('--legacy-dnd')) return false;
+  if (!shellUtils?.registerDropTarget) return false;
+  return (
+    process.argv.includes('--stardock-dnd-experiment') ||
+    process.argv.includes('--native-dnd')
+  );
+}
+
+function isNativeDnDEnabled() {
+  return shouldUseOleDropTarget();
+}
+
+function broadcastInterFenceDragPhase(active, sourceFenceId = null) {
+  for (const [fenceId, w] of openFences.entries()) {
+    if (active && sourceFenceId && fenceId === sourceFenceId) continue;
+    try {
+      if (!w.isDestroyed()) w.webContents.send('inter-fence-drag-phase', !!active);
+    } catch {}
+  }
+}
 
 function shouldSkipDuplicateInterFenceDrop(sourceFenceId, targetFenceId, paths) {
   const key = `${sourceFenceId || ''}->${targetFenceId || ''}:${(paths || []).join('|')}`;
@@ -852,7 +889,7 @@ async function movePathsBetweenFences(filePaths, sourceFenceId, targetFenceId) {
   if (sourceFenceId === targetFenceId) return false;
   if (shouldSkipDuplicateInterFenceDrop(sourceFenceId, targetFenceId, filePaths)) return false;
 
-  const targetDir = path.join(FENCES_BASE_DIR, targetFenceId);
+  const targetDir = getFenceStorageDir(targetFenceId);
   fs.mkdirSync(targetDir, { recursive: true });
 
   let moved = 0;
@@ -873,66 +910,160 @@ async function movePathsBetweenFences(filePaths, sourceFenceId, targetFenceId) {
   return moved > 0;
 }
 
-async function copyExternalPathsToFence(filePaths, targetFenceId) {
+async function importExternalPathToFence(srcFullPath, targetFenceId) {
+  if (!srcFullPath || typeof srcFullPath !== "string" || !fs.existsSync(srcFullPath)) return false;
+
+  const srcNorm = path.normalize(srcFullPath);
+  const dir = getFenceStorageDir(targetFenceId);
+  fs.mkdirSync(dir, { recursive: true });
+  const dirNorm = path.normalize(dir);
+  if (srcNorm.startsWith(dirNorm + path.sep)) return false;
+
+  const destName = sanitizeFileName(path.basename(srcNorm));
+  const destPath = ensureUniqueDest(path.join(dir, destName));
+
+  if (isProtectedDesktopSource(srcNorm)) {
+    await copyPathIntoFence(srcNorm, destPath);
+    await tryHidePublicDesktopShortcut(srcNorm);
+    return true;
+  }
+
+  try {
+    await fs.promises.rename(srcNorm, destPath);
+    try {
+      shellUtils?.notifyShellCreate?.(destPath);
+      shellUtils?.notifyShellDelete?.(srcNorm);
+    } catch {}
+    return true;
+  } catch (e) {
+    if (e.code === "EPERM" || e.code === "EACCES") {
+      await copyPathIntoFence(srcNorm, destPath);
+      return true;
+    }
+    if (e.code !== "EXDEV") throw e;
+  }
+
+  const st = fs.lstatSync(srcNorm);
+  if (st.isDirectory()) {
+    await fs.promises.cp(srcNorm, destPath, { recursive: true });
+    await fs.promises.rm(srcNorm, { recursive: true, force: true });
+  } else {
+    await copyPathIntoFence(srcNorm, destPath);
+    try { await fs.promises.unlink(srcNorm); } catch {}
+  }
+  try {
+    shellUtils?.notifyShellCreate?.(destPath);
+    shellUtils?.notifyShellDelete?.(srcNorm);
+  } catch {}
+  return true;
+}
+
+async function importExternalPathsToFence(filePaths, targetFenceId) {
   if (!Array.isArray(filePaths) || !filePaths.length) return false;
   if (!isValidFenceId(targetFenceId)) return false;
 
-  const dir = path.join(FENCES_BASE_DIR, targetFenceId);
-  fs.mkdirSync(dir, { recursive: true });
-  let copied = 0;
-
+  let imported = 0;
   for (const fp of filePaths) {
     try {
-      if (!fp || typeof fp !== "string") continue;
-      if (!fs.existsSync(fp)) continue;
-      const destName = sanitizeFileName(path.basename(fp));
-      const destPath = ensureUniqueDest(path.join(dir, destName));
-      const st = fs.lstatSync(fp);
-      if (st.isDirectory()) {
-        await fs.promises.cp(fp, destPath, { recursive: true });
-      } else {
-        try {
-          await fs.promises.copyFile(fp, destPath);
-        } catch {
-          await streamCopy(fp, destPath);
-        }
-      }
-      copied++;
-    } catch {}
+      if (await importExternalPathToFence(fp, targetFenceId)) imported++;
+    } catch (e) {
+      console.warn("[import-external] skip", fp, e.message);
+    }
   }
 
-  if (openFences.has(targetFenceId)) openFences.get(targetFenceId).webContents.send("fence-refresh");
-  return copied > 0;
+  if (imported > 0) notifyFenceRefresh(targetFenceId);
+  return imported > 0;
 }
 
+/** @deprecated alias — preferer importExternalPathsToFence */
+async function copyExternalPathsToFence(filePaths, targetFenceId) {
+  return importExternalPathsToFence(filePaths, targetFenceId);
+}
+
+async function handleOleDropPayload(payload, targetFenceId) {
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.kind === "internal" && typeof payload.internal === "string") {
+    const lines = payload.internal.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const sourceFenceId = lines.shift();
+    const paths = lines;
+    const moved = await movePathsBetweenFences(paths, sourceFenceId, targetFenceId);
+    if (moved) {
+      draggedItem = null;
+      broadcastInterFenceDragPhase(false);
+      scheduleDeferredDesktopPlaceholderCleanup();
+    }
+    return moved;
+  }
+  if (payload.kind === "files" && Array.isArray(payload.files)) {
+    const allFiles = payload.files.filter((fp) => typeof fp === "string" && fp.trim());
+    const realFiles = allFiles.filter((fp) => !isDragPlaceholderPath(fp));
+    const hasPlaceholder = allFiles.some((fp) => isDragPlaceholderPath(fp));
+    if (realFiles.length) {
+      const imported = await importExternalPathsToFence(realFiles, targetFenceId);
+      if (imported) draggedItem = null;
+      return imported;
+    }
+    if (hasPlaceholder && draggedItem) {
+      const moved = await movePathsBetweenFences(
+        draggedItem.filePaths,
+        draggedItem.fenceId,
+        targetFenceId
+      );
+      if (moved) {
+        draggedItem = null;
+        broadcastInterFenceDragPhase(false);
+        scheduleDeferredDesktopPlaceholderCleanup();
+      }
+      return moved;
+    }
+  }
+  return false;
+}
+
+const oleDropTargetsAttached = new WeakSet();
+
 function attachOleDropTargetToFenceWindow(win, fenceId) {
-  if (!shellUtils?.registerDropTarget || !shellUtils?.revokeDropTarget) return;
+  if (!shouldUseOleDropTarget()) return false;
+  if (oleDropTargetsAttached.has(win)) return true;
   try {
-    const handle = win.getNativeWindowHandle(); // Buffer
+    const handle = win.getNativeWindowHandle();
     const ok = shellUtils.registerDropTarget(handle, async (payload) => {
       try {
-        if (!payload || typeof payload !== "object") return;
-        if (payload.kind === "internal" && typeof payload.internal === "string") {
-          const lines = payload.internal.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-          const sourceFenceId = lines.shift();
-          const paths = lines;
-          await movePathsBetweenFences(paths, sourceFenceId, fenceId);
-          return;
-        }
-        if (payload.kind === "files" && Array.isArray(payload.files)) {
-          const realFiles = payload.files.filter((fp) => !isDragPlaceholderPath(fp));
-          if (realFiles.length) await copyExternalPathsToFence(realFiles, fenceId);
-        }
-      } catch {}
+        await handleOleDropPayload(payload, fenceId);
+      } catch (e) {
+        console.warn("[ole-drop-target] drop handler error", e.message);
+      }
     });
     if (!ok) {
-      try { console.warn("[ole-drop-target] register failed for fence", fenceId); } catch {}
-      return;
+      console.warn("[ole-drop-target] register failed for fence", fenceId);
+      return false;
     }
-    win.on('closed', () => {
+    oleDropTargetsAttached.add(win);
+    console.log("[ole-drop-target] registered for fence", fenceId);
+    win.once("closed", () => {
+      oleDropTargetsAttached.delete(win);
       try { shellUtils.revokeDropTarget(handle); } catch {}
     });
-  } catch {}
+    return true;
+  } catch (e) {
+    console.warn("[ole-drop-target] attach error", e.message);
+    return false;
+  }
+}
+
+function scheduleOleDropTargetAttach(win, fenceId) {
+  const attempt = (n = 0) => {
+    if (win.isDestroyed()) return;
+    const ok = attachOleDropTargetToFenceWindow(win, fenceId);
+    if (!ok && n < 8) {
+      setTimeout(() => attempt(n + 1), 150 * (n + 1));
+    }
+  };
+  if (win.webContents.isLoading()) {
+    win.webContents.once("did-finish-load", () => attempt(0));
+  } else {
+    setTimeout(() => attempt(0), 50);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -941,10 +1072,157 @@ function attachOleDropTargetToFenceWindow(win, fenceId) {
 
 function ensureBaseDir() {
   try {
-    fs.mkdirSync(FENCES_BASE_DIR, { recursive: true });
+    fs.mkdirSync(LEGACY_FENCES_BASE_DIR, { recursive: true });
+    fs.mkdirSync(getDesktopBoxesRoot(), { recursive: true });
+    migrateLegacyStorageToDesktop();
+    hideDesktopStorageFromExplorer();
   } catch (e) {
     console.error("[fences] mkdir failed", e);
   }
+}
+
+function getPublicDesktopPath() {
+  const pub = process.env.PUBLIC || path.join("C:", "Users", "Public");
+  return path.normalize(path.join(pub, "Desktop"));
+}
+
+function getDesktopCandidatePaths() {
+  const desktop = app.getPath("desktop");
+  return Array.from(new Set([
+    desktop,
+    path.join(os.homedir(), "Desktop"),
+    path.join(os.homedir(), "OneDrive", "Desktop"),
+    getPublicDesktopPath(),
+  ].filter(Boolean).map((p) => path.normalize(p))));
+}
+
+function isOnDesktopRoot(filePath) {
+  if (!filePath || typeof filePath !== "string") return false;
+  const srcDir = path.dirname(path.normalize(filePath));
+  return getDesktopCandidatePaths().some((d) => srcDir.toLowerCase() === d.toLowerCase());
+}
+
+/** Bureau public / emplacements où la source ne doit pas être supprimée (EPERM). */
+function isProtectedDesktopSource(filePath) {
+  if (!filePath || typeof filePath !== "string") return false;
+  const srcDir = path.dirname(path.normalize(filePath));
+  return srcDir.toLowerCase() === getPublicDesktopPath().toLowerCase();
+}
+
+function fenceImportResult(destPath, { copyOnly = false, reason = "", hiddenOriginal = false } = {}) {
+  if (copyOnly) return { destPath, copyOnly: true, reason, hiddenOriginal };
+  return destPath;
+}
+
+async function tryHidePublicDesktopShortcut(srcNorm) {
+  if (!isProtectedDesktopSource(srcNorm) || !fs.existsSync(srcNorm)) return false;
+  if (process.platform !== "win32") return false;
+  try {
+    if (shellUtils?.hideFileNow?.(srcNorm)) return true;
+  } catch {}
+  try {
+    await markFileHiddenSystemBestEffort(srcNorm);
+    return true;
+  } catch {}
+  return false;
+}
+
+async function copyPathIntoFence(srcNorm, destPath) {
+  const st = fs.lstatSync(srcNorm);
+  if (st.isDirectory()) {
+    await fs.promises.cp(srcNorm, destPath, { recursive: true });
+  } else {
+    try {
+      await fs.promises.copyFile(srcNorm, destPath);
+    } catch {
+      await streamCopy(srcNorm, destPath);
+    }
+  }
+  return destPath;
+}
+
+function getFenceDesktopFolder(fenceId) {
+  const cfg = readConfig();
+  const fence = cfg.fences.find((f) => f.id === fenceId);
+  const fenceName = (fence?.name || "").trim() || `Fence-${String(fenceId || "").slice(0, 8)}` || "Fence";
+  const safeName = fenceName.replace(/[<>:"/\\|?*]/g, "_").trim() || "Fence";
+  return path.join(app.getPath("desktop"), safeName);
+}
+
+async function organizeDesktopOriginal(srcFullPath, fenceId) {
+  const cfg = readConfig();
+  if (!(cfg.autoOrganizeDesktop ?? true)) return { ok: false, reason: "disabled" };
+
+  const srcNorm = path.normalize(srcFullPath);
+  if (!isOnDesktopRoot(srcNorm)) return { ok: false, reason: "not-on-desktop" };
+  if (isProtectedDesktopSource(srcNorm)) return { ok: false, reason: "protected-desktop" };
+  if (!fs.existsSync(srcNorm)) return { ok: false, reason: "source-missing" };
+
+  const boxFolder = getFenceDesktopFolder(fenceId);
+  fs.mkdirSync(boxFolder, { recursive: true });
+
+  const fileName = path.basename(srcNorm);
+  const dest = path.join(boxFolder, fileName);
+
+  try {
+    if (fs.existsSync(dest)) {
+      await fs.promises.rm(dest, { recursive: true, force: true });
+    }
+  } catch {}
+
+  await fs.promises.rename(srcNorm, dest);
+  restartFenceDirWatch(fenceId);
+  return { ok: true, destPath: dest, folderPath: boxFolder };
+}
+
+function notifyFenceRefresh(fenceId) {
+  if (isValidFenceId(fenceId) && openFences.has(fenceId)) {
+    openFences.get(fenceId).webContents.send("fence-refresh");
+  }
+}
+
+function scheduleFenceDirRefresh(fenceId) {
+  const entry = fenceDirWatchers.get(fenceId);
+  if (!entry) return;
+  clearTimeout(entry.debounceTimer);
+  entry.debounceTimer = setTimeout(() => notifyFenceRefresh(fenceId), 180);
+}
+
+function stopFenceDirWatch(fenceId) {
+  const entry = fenceDirWatchers.get(fenceId);
+  if (!entry) return;
+  clearTimeout(entry.debounceTimer);
+  try { entry.fenceWatcher?.close(); } catch {}
+  try { entry.desktopWatcher?.close(); } catch {}
+  fenceDirWatchers.delete(fenceId);
+}
+
+function startFenceDirWatch(fenceId) {
+  if (!isValidFenceId(fenceId)) return;
+  stopFenceDirWatch(fenceId);
+
+  const fenceDir = getFenceStorageDir(fenceId);
+  try {
+    fs.mkdirSync(fenceDir, { recursive: true });
+  } catch {}
+
+  const entry = { debounceTimer: null, fenceWatcher: null };
+
+  try {
+    entry.fenceWatcher = fs.watch(fenceDir, { recursive: true }, () => scheduleFenceDirRefresh(fenceId));
+  } catch {
+    try {
+      entry.fenceWatcher = fs.watch(fenceDir, () => scheduleFenceDirRefresh(fenceId));
+    } catch (e) {
+      console.warn("[fence-watch] failed for", fenceId, e);
+    }
+  }
+
+  fenceDirWatchers.set(fenceId, entry);
+}
+
+function restartFenceDirWatch(fenceId) {
+  if (openFences.has(fenceId)) startFenceDirWatch(fenceId);
 }
 
 function readConfig() {
@@ -978,9 +1256,254 @@ function isPathInside(childPath, parentPath) {
     child.toLowerCase() === parent.toLowerCase();
 }
 
-/** Vérifie que le chemin est dans le dossier fences */
+/** Vérifie que le chemin appartient à une box (bureau ou AppData legacy). */
 function isPathInFences(filePath) {
-  return isPathInside(filePath, FENCES_BASE_DIR);
+  if (!filePath || typeof filePath !== "string") return false;
+  const p = path.normalize(filePath);
+  const cfg = readConfig();
+
+  if (cfg.storageMode === "appdata") {
+    return isPathInside(p, LEGACY_FENCES_BASE_DIR);
+  }
+
+  for (const f of cfg.fences) {
+    if (f.storagePath && isPathInside(p, f.storagePath)) return true;
+  }
+  return isPathInside(p, LEGACY_FENCES_BASE_DIR);
+}
+
+function getFenceIdForPath(filePath) {
+  if (!filePath || typeof filePath !== "string") return null;
+  const p = path.normalize(filePath);
+  const cfg = readConfig();
+  for (const f of cfg.fences) {
+    if (f.storagePath && isPathInside(p, f.storagePath)) return f.id;
+  }
+  for (const f of cfg.fences) {
+    const legacy = path.join(LEGACY_FENCES_BASE_DIR, f.id);
+    if (isPathInside(p, legacy)) return f.id;
+  }
+  return null;
+}
+
+function usesDesktopStorage() {
+  const cfg = readConfig();
+  return cfg.storageMode !== "appdata";
+}
+
+function getDesktopBoxesRoot() {
+  return path.join(app.getPath("desktop"), DESKTOP_BOXES_DIRNAME);
+}
+
+function sanitizeFenceFolderName(name) {
+  const clean = String(name || "Box").replace(/[<>:"/\\|?*]/g, "_").trim();
+  return clean || "Box";
+}
+
+function readFenceMarker(storageDir) {
+  try {
+    return fs.readFileSync(path.join(storageDir, FENCE_MARKER_FILE), "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+function writeFenceMarker(storageDir, fenceId) {
+  try {
+    fs.writeFileSync(path.join(storageDir, FENCE_MARKER_FILE), fenceId, "utf8");
+  } catch {}
+}
+
+function resolveUniqueDesktopFencePath(fenceName, fenceId) {
+  const root = getDesktopBoxesRoot();
+  const base = sanitizeFenceFolderName(fenceName);
+  let candidate = path.join(root, base);
+
+  if (!fs.existsSync(candidate)) return candidate;
+  if (readFenceMarker(candidate) === fenceId) return candidate;
+
+  let i = 2;
+  while (true) {
+    candidate = path.join(root, `${base} (${i})`);
+    if (!fs.existsSync(candidate)) return candidate;
+    if (readFenceMarker(candidate) === fenceId) return candidate;
+    i++;
+  }
+}
+
+function getFenceStorageDir(fenceId) {
+  if (!isValidFenceId(fenceId)) {
+    return path.join(LEGACY_FENCES_BASE_DIR, String(fenceId || "invalid"));
+  }
+  const cfg = readConfig();
+  if (cfg.storageMode === "appdata") {
+    return path.join(LEGACY_FENCES_BASE_DIR, fenceId);
+  }
+  const f = cfg.fences.find((x) => x.id === fenceId);
+  if (f?.storagePath) return path.normalize(f.storagePath);
+  const legacy = path.join(LEGACY_FENCES_BASE_DIR, fenceId);
+  if (fs.existsSync(legacy)) return legacy;
+  return resolveUniqueDesktopFencePath(f?.name || "Box", fenceId);
+}
+
+function ensureFenceStorageDir(fenceId, fenceName) {
+  const cfg = readConfig();
+  let f = cfg.fences.find((x) => x.id === fenceId);
+  if (!f) return getFenceStorageDir(fenceId);
+
+  let dir;
+  let changed = false;
+
+  if (cfg.storageMode === "appdata") {
+    dir = path.join(LEGACY_FENCES_BASE_DIR, fenceId);
+  } else {
+    if (!f.storagePath) {
+      f.storagePath = resolveUniqueDesktopFencePath(fenceName || f.name, fenceId);
+      changed = true;
+    }
+    dir = f.storagePath;
+  }
+
+  if (changed) writeConfig(cfg);
+  fs.mkdirSync(dir, { recursive: true });
+  if (cfg.storageMode !== "appdata") writeFenceMarker(dir, fenceId);
+  hideDesktopStorageFromExplorer();
+  return dir;
+}
+
+function shouldHideDesktopStorage() {
+  const cfg = readConfig();
+  if (cfg.storageMode === "appdata") return false;
+  return cfg.hideDesktopStorage !== false;
+}
+
+/** Rend un fichier visible sur le bureau (inverse de hideFileNow). */
+async function showPathOnDesktopExplorer(filePath) {
+  if (process.platform !== "win32" || !filePath) return;
+  try {
+    await execFileAsync(
+      "cmd.exe",
+      ["/c", "attrib", "-H", "-S", filePath],
+      { windowsHide: true, timeout: 2000 }
+    );
+  } catch {}
+  try {
+    shellUtils?.notifyShellCreate?.(filePath);
+    shellUtils?.notifyShellUpdateItem?.(filePath);
+  } catch {}
+}
+
+/** Masque le dossier Bureau\\Boxes et les marqueurs .boxes-fence-id (Phase 3). */
+function hideDesktopStorageFromExplorer() {
+  if (!shouldHideDesktopStorage() || process.platform !== "win32") return;
+
+  const root = getDesktopBoxesRoot();
+  try {
+    fs.mkdirSync(root, { recursive: true });
+    markFileHiddenSystemBestEffort(root);
+  } catch {}
+
+  try {
+    for (const f of readConfig().fences) {
+      const dir = f.storagePath;
+      if (!dir || !fs.existsSync(dir)) continue;
+      markFileHiddenSystemBestEffort(dir);
+      markFileHiddenSystemBestEffort(path.join(dir, FENCE_MARKER_FILE));
+    }
+  } catch {}
+}
+
+function shouldHideWindowsDesktopIcons() {
+  const cfg = readConfig();
+  if (cfg.hideWindowsDesktopIcons === undefined) {
+    return usesDesktopStorage();
+  }
+  return !!cfg.hideWindowsDesktopIcons;
+}
+
+function applyWindowsDesktopIconsVisibility() {
+  if (process.platform !== "win32" || !shellUtils?.setDesktopIconsVisible) return false;
+  try {
+    const visible = !shouldHideWindowsDesktopIcons();
+    return !!shellUtils.setDesktopIconsVisible(visible);
+  } catch {
+    return false;
+  }
+}
+
+function restoreWindowsDesktopIcons() {
+  if (process.platform !== "win32") return false;
+  if (!shellUtils?.setDesktopIconsVisible) {
+    console.warn("[desktop-icons] shell_utils.setDesktopIconsVisible indisponible");
+    return false;
+  }
+  try {
+    return !!shellUtils.setDesktopIconsVisible(true);
+  } catch (e) {
+    console.warn("[desktop-icons] restore failed", e.message);
+    return false;
+  }
+}
+
+function migrateLegacyStorageToDesktop() {
+  const cfg = readConfig();
+  if (cfg.storageMode === "appdata") return;
+
+  let changed = false;
+  if (cfg.storageMode !== "desktop") {
+    cfg.storageMode = "desktop";
+    changed = true;
+  }
+
+  fs.mkdirSync(getDesktopBoxesRoot(), { recursive: true });
+
+  for (const f of cfg.fences) {
+    const legacyDir = path.join(LEGACY_FENCES_BASE_DIR, f.id);
+    let dest = f.storagePath && fs.existsSync(f.storagePath)
+      ? path.normalize(f.storagePath)
+      : null;
+
+    if (!dest) {
+      dest = resolveUniqueDesktopFencePath(f.name, f.id);
+      f.storagePath = dest;
+      changed = true;
+    }
+
+    fs.mkdirSync(dest, { recursive: true });
+    writeFenceMarker(dest, f.id);
+
+    if (!fs.existsSync(legacyDir)) continue;
+
+    for (const entry of fs.readdirSync(legacyDir, { withFileTypes: true })) {
+      if (entry.name === FENCE_MARKER_FILE) continue;
+      const src = path.join(legacyDir, entry.name);
+      const dst = path.join(dest, entry.name);
+      if (fs.existsSync(dst)) continue;
+      try {
+        fs.renameSync(src, dst);
+      } catch {
+        try {
+          if (entry.isDirectory()) {
+            fs.cpSync(src, dst, { recursive: true });
+            fs.rmSync(src, { recursive: true, force: true });
+          } else {
+            fs.copyFileSync(src, dst);
+            fs.unlinkSync(src);
+          }
+        } catch (e) {
+          console.warn("[migrate] skip", src, e.message);
+        }
+      }
+    }
+
+    try {
+      const left = fs.readdirSync(legacyDir);
+      if (left.length === 0) fs.rmSync(legacyDir, { recursive: true, force: true });
+    } catch {}
+  }
+
+  if (changed) writeConfig(cfg);
+  hideDesktopStorageFromExplorer();
 }
 
 /** Vérifie que le chemin est sur le bureau */
@@ -1037,11 +1560,6 @@ function validateConfig(cfg) {
 // ─────────────────────────────────────────────
 
 function createFence(fenceId, fenceName) {
-  const fenceDir = path.join(FENCES_BASE_DIR, fenceId);
-  try {
-    fs.mkdirSync(fenceDir, { recursive: true });
-  } catch { }
-
   const cfg = readConfig();
   let fenceConfig = cfg.fences.find((f) => f.id === fenceId);
 
@@ -1054,6 +1572,8 @@ function createFence(fenceId, fenceName) {
     cfg.fences.push(fenceConfig);
     writeConfig(cfg);
   }
+
+  ensureFenceStorageDir(fenceId, fenceConfig.name);
 
   const isRolledOnStart = fenceConfig.rolled ?? false;
 
@@ -1081,11 +1601,7 @@ function createFence(fenceId, fenceName) {
     },
   });
 
-  // Le DropTarget OLE est réservé au mode expérimental.
-  // En mode normal, il peut intercepter l'inter-box et provoquer des copies.
-  if (ENABLE_STARDOCK_DND_EXPERIMENT) {
-    attachOleDropTargetToFenceWindow(win, fenceId);
-  }
+  scheduleOleDropTargetAttach(win, fenceId);
 
   // Sécurité navigation : aucune ouverture/navigations externes depuis le renderer.
   // (deny-by-default)
@@ -1098,6 +1614,10 @@ function createFence(fenceId, fenceName) {
       if (url.startsWith('file:')) return;
     } catch {}
     e.preventDefault();
+  });
+
+  win.webContents.on('drag-end', () => {
+    scheduleShellDragInactive(200);
   });
 
   // sauvegarde position/taille
@@ -1167,6 +1687,7 @@ function createFence(fenceId, fenceName) {
       }
     } catch { }
     openFences.delete(fenceId);
+    stopFenceDirWatch(fenceId);
   });
 
   win.loadFile("fence.html");
@@ -1187,6 +1708,7 @@ function createFence(fenceId, fenceName) {
     }
   });
   openFences.set(fenceId, win);
+  startFenceDirWatch(fenceId);
   return win;
 }
 
@@ -1430,6 +1952,7 @@ ipcMain.handle("manager-close", (evt) => {
 });
 
 ipcMain.handle("quit-app", () => {
+  restoreWindowsDesktopIcons();
   app.isQuitting = true;
   app.quit();
 });
@@ -1469,7 +1992,7 @@ ipcMain.handle("delete-fence", async (_evt, fenceId) => {
   try {
     if (openFences.has(fenceId)) openFences.get(fenceId).close();
 
-    const dir = path.join(FENCES_BASE_DIR, fenceId);
+    const dir = getFenceStorageDir(fenceId);
     if (fs.existsSync(dir)) await shell.trashItem(dir);
 
     const cfg = readConfig();
@@ -1525,6 +2048,8 @@ ipcMain.handle("get-fence-info", (_evt, fenceId) => {
   return cfg.fences.find((f) => f.id === fenceId) || null;
 });
 
+ipcMain.handle("get-native-dnd-enabled", () => isNativeDnDEnabled());
+
 ipcMain.handle("set-fence-style", (_evt, { fenceId, color, opacity }) => {
   const cfg = readConfig();
   const f = cfg.fences.find((x) => x.id === fenceId);
@@ -1550,6 +2075,7 @@ ipcMain.handle("set-fence-name", (_evt, { fenceId, newName }) => {
     f.name = name;
     writeConfig(cfg);
     if (openFences.has(fenceId)) openFences.get(fenceId).setTitle(name);
+    restartFenceDirWatch(fenceId);
     if (managerWin && !managerWin.isDestroyed())
       managerWin.webContents.send('manager-refresh');
   }
@@ -1582,6 +2108,25 @@ ipcMain.handle("set-fence-icon-size", (_evt, { fenceId, iconSize }) => {
   return f?.iconSize ?? 48;
 });
 
+ipcMain.handle("set-fence-col-width", (_evt, { fenceId, colWidth }) => {
+  const cfg = readConfig();
+  const f = cfg.fences.find((x) => x.id === fenceId);
+  const iconMin = (f?.iconSize ?? 48) + 16;
+  const maxW = 280;
+  const width = Math.min(maxW, Math.max(iconMin, Math.round(Number(colWidth) || iconMin)));
+  if (f) {
+    f.colWidth = width;
+    writeConfig(cfg);
+    if (openFences.has(fenceId)) {
+      const win = openFences.get(fenceId);
+      const send = () => win.webContents.send("col-width-changed", width);
+      if (win.webContents.isLoading()) win.webContents.once("did-finish-load", send);
+      else send();
+    }
+  }
+  return f?.colWidth ?? width;
+});
+
 ipcMain.handle("set-fence-show-extensions", (_evt, { fenceId, showExtensions }) => {
   const cfg = readConfig();
   const f = cfg.fences.find((x) => x.id === fenceId);
@@ -1608,10 +2153,11 @@ ipcMain.handle("set-fence-show-extensions", (_evt, { fenceId, showExtensions }) 
 ipcMain.handle("list-fence-items", (_evt, fenceId) => {
   try {
     if (!isValidFenceId(fenceId)) return [];
-    const dir = path.join(FENCES_BASE_DIR, fenceId);
+    const dir = getFenceStorageDir(fenceId);
     if (!fs.existsSync(dir)) return [];
     return fs
       .readdirSync(dir)
+      .filter((f) => f !== FENCE_MARKER_FILE)
       .map((f) => path.join(dir, f));
   } catch {
     return [];
@@ -1651,7 +2197,7 @@ ipcMain.handle("copy-to-fence", async (_evt, { fenceId, srcFullPath, destName })
     if (!isValidFenceId(fenceId)) throw new Error("Invalid fenceId");
     const safeName = sanitizeFileName(destName);
 
-    const dir = path.join(FENCES_BASE_DIR, fenceId);
+    const dir = getFenceStorageDir(fenceId);
     fs.mkdirSync(dir, { recursive: true });
 
     // Si le fichier source est déjà dans cette fence, ne rien faire
@@ -1687,32 +2233,68 @@ ipcMain.handle("move-to-fence", async (_evt, { fenceId, srcFullPath, destName })
     const safeName = sanitizeFileName(destName);
     const srcNorm = path.normalize(srcFullPath);
 
-    const dir = path.join(FENCES_BASE_DIR, fenceId);
+    const dir = getFenceStorageDir(fenceId);
     fs.mkdirSync(dir, { recursive: true });
 
-    // Si le fichier source est déjà dans cette fence, ne rien faire
     const dirNorm = path.normalize(dir);
-    if (srcNorm.startsWith(dirNorm + path.sep)) return srcFullPath;
+    if (srcNorm.startsWith(dirNorm + path.sep)) return srcNorm;
+
+    const cfg = readConfig();
+    const autoOrganize = cfg.autoOrganizeDesktop ?? true;
+    const shouldOrganizeDesktop =
+      cfg.storageMode === "appdata" &&
+      autoOrganize &&
+      isOnDesktopRoot(srcNorm) &&
+      !isProtectedDesktopSource(srcNorm);
+
+    if (isProtectedDesktopSource(srcNorm)) {
+      const destPath = ensureUniqueDest(path.join(dir, safeName));
+      await copyPathIntoFence(srcNorm, destPath);
+      const hiddenOriginal = await tryHidePublicDesktopShortcut(srcNorm);
+      notifyFenceRefresh(fenceId);
+      return fenceImportResult(destPath, {
+        copyOnly: true,
+        reason: "protected-desktop",
+        hiddenOriginal,
+      });
+    }
+
+    if (shouldOrganizeDesktop) {
+      const destPath = ensureUniqueDest(path.join(dir, safeName));
+      await copyPathIntoFence(srcNorm, destPath);
+      try {
+        await organizeDesktopOriginal(srcNorm, fenceId);
+      } catch (e) {
+        console.warn("[move-to-fence] organize desktop failed", e);
+      }
+      notifyFenceRefresh(fenceId);
+      return destPath;
+    }
 
     const destPath = ensureUniqueDest(path.join(dir, safeName));
 
-    // Priorité : rename atomique (même disque, le plus rapide)
     try {
       await fs.promises.rename(srcNorm, destPath);
+      notifyFenceRefresh(fenceId);
       return destPath;
     } catch (e) {
-      if (e.code !== 'EXDEV') throw e; // Cross-drive uniquement : continuer
+      if (e.code === "EPERM" || e.code === "EACCES") {
+        await copyPathIntoFence(srcNorm, destPath);
+        notifyFenceRefresh(fenceId);
+        return fenceImportResult(destPath, { copyOnly: true, reason: "permission-denied" });
+      }
+      if (e.code !== "EXDEV") throw e;
     }
 
-    // Fallback cross-drive : copy + delete
     const st = fs.lstatSync(srcNorm);
     if (st.isDirectory()) {
       await fs.promises.cp(srcNorm, destPath, { recursive: true });
       await fs.promises.rm(srcNorm, { recursive: true, force: true });
     } else {
       try { await fs.promises.copyFile(srcNorm, destPath); } catch { await streamCopy(srcNorm, destPath); }
-      await fs.promises.unlink(srcNorm);
+      try { await fs.promises.unlink(srcNorm); } catch {}
     }
+    notifyFenceRefresh(fenceId);
     return destPath;
   } catch (e) {
     console.error("[move-to-fence] failed", e);
@@ -1725,7 +2307,7 @@ ipcMain.handle("write-buffer-to-fence", async (_evt, { fenceId, destName, buffer
     if (!isValidFenceId(fenceId)) throw new Error("Invalid fenceId");
     const safeName = sanitizeFileName(destName);
 
-    const dir = path.join(FENCES_BASE_DIR, fenceId);
+    const dir = getFenceStorageDir(fenceId);
     fs.mkdirSync(dir, { recursive: true });
     const destPath = ensureUniqueDest(path.join(dir, safeName));
     const buf = buffer instanceof ArrayBuffer ? Buffer.from(buffer) : Buffer.from(buffer);
@@ -2368,26 +2950,40 @@ async function getLnkIcon(lnkPath) {
   // ─────────────────────────────────────────────
 
   ipcMain.handle("fence-drag-start", (_evt, { filePath, filePaths, fenceId }) => {
-    // Accepte un seul fichier (filePath) ou plusieurs (filePaths)
     const paths = filePaths ?? (filePath ? [filePath] : []);
     _desktopDropFinalized = false;
     _desktopDropFinalizing = false;
     draggedItem = { filePaths: paths, fenceId };
-    // Sécurité : expiration automatique après 10s si aucun drop ne se produit
     if (draggedItem._expireTimer) clearTimeout(draggedItem._expireTimer);
-    draggedItem._expireTimer = setTimeout(() => { draggedItem = null; }, 10000);
+    draggedItem._expireTimer = setTimeout(() => {
+      draggedItem = null;
+      broadcastInterFenceDragPhase(false);
+    }, 10000);
+    broadcastInterFenceDragPhase(true, fenceId);
     return true;
   });
 
-  // Drag natif : permet de déposer un fichier depuis une box vers le bureau ou l'explorateur
+  ipcMain.on("fence-drag-start-sync", (evt, { filePath, filePaths, fenceId }) => {
+    const paths = filePaths ?? (filePath ? [filePath] : []);
+    _desktopDropFinalized = false;
+    _desktopDropFinalizing = false;
+    draggedItem = { filePaths: paths, fenceId };
+    if (draggedItem._expireTimer) clearTimeout(draggedItem._expireTimer);
+    draggedItem._expireTimer = setTimeout(() => {
+      draggedItem = null;
+      broadcastInterFenceDragPhase(false);
+    }, 10000);
+    broadcastInterFenceDragPhase(true, fenceId);
+    evt.returnValue = true;
+  });
+
+  // Drag natif : placeholder unique (modèle stable inter-box + bureau)
   const startNativeDragWithPlaceholder = (evt, payload) => {
     try {
       const { filePaths, fenceId } = (payload && typeof payload === 'object') ? payload : { filePaths: payload, fenceId: null };
-      // Accepte un chemin unique (string) ou un tableau
       const paths = Array.isArray(filePaths) ? filePaths : [filePaths];
       if (!paths.length) return false;
 
-      // Ne conserver que des chemins valides issus des fences
       const validPaths = paths.filter(fp => {
         if (!fp || typeof fp !== 'string') return false;
         const p = path.normalize(fp);
@@ -2398,57 +2994,29 @@ async function getLnkIcon(lnkPath) {
       const win = BrowserWindow.fromWebContents(evt.sender);
       if (!win || win.isDestroyed()) return false;
 
-      const srcFenceId = (typeof fenceId === 'string' && isValidFenceId(fenceId)) ? fenceId : null;
-
-      // NOTE:
-      // Le DropTarget OLE ne s'enregistre pas chez certains utilisateurs, donc le drag inter-box
-      // doit rester sur placeholder `startDrag`. On utilise donc placeholder pour TOUT drag
-      // qui part d'une fence, et on finalise le drop sur le bureau via dragend (détection du placeholder).
-      const winClass = (() => {
-        try { return shellUtils?.getWindowClassUnderCursor?.(); } catch { return null; }
-      })();
-
-      // Fallback : ancienne méthode placeholder si l'addon n'a pas startFileDrag
-      // ou si on est au-dessus d'une autre box (drag inter-box).
-      if (winClass) { try { console.log('[native-drag-start] placeholder; winClass=', winClass); } catch {} }
       const firstNorm = path.normalize(validPaths[0]);
       if (win.isDestroyed() || win.webContents.isDestroyed()) return false;
 
-      // ⚠️ Certains environnements bloquent la création d'un nom fixe dans %TEMP% (EPERM).
-      // Utiliser un nom unique à chaque drag évite les conflits/locks/policies.
       const tmpFile = path.join(
         os.tmpdir(),
-        `boxes-drag-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.tmp`
+        `boxes-drag-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.tmp`
       );
-      fs.writeFileSync(tmpFile, '');
-      // Ne pas marquer HIDDEN+SYSTEM ici : ce flag sur la source empêche le IDropTarget Windows
-      // d'accepter le drop (curseur interdit) et bloque dataTransfer.files côté cible.
-      // Le masquage est appliqué au moment où le placeholder est détecté sur le bureau.
+      fs.writeFileSync(tmpFile, "");
       lastDragPlaceholderBaseName = path.basename(tmpFile);
       lastDragPlaceholderPath = tmpFile;
-      markShellDragActive();
 
-      // ⚠️ startDrag doit être appelé dans la fenêtre de temps du dragstart Chromium (~5 ms).
-      // getFileIcon peut prendre 20-50 ms sur un cache froid (icône jamais vue, fichier déplacé),
-      // ce qui retarderait startDrag et ferait partir le drag en HTML5 pur → curseur interdit.
-      // On utilise donc l'icône de repli immédiatement, puis on récupère la vraie en arrière-plan.
       const fallbackIcon = nativeImage.createFromBuffer(Buffer.from(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNl7BcQAAAABJRU5ErkJggg==",
         "base64"
       ));
       win.webContents.startDrag({ file: tmpFile, icon: fallbackIcon });
-      // Récupération de l'icône en arrière-plan (pour usage futur, startDrag ne peut plus être mis à jour)
-      app.getFileIcon(firstNorm, { size: 'small' }).catch(() => {});
-      scheduleShellDragInactive(30000);
+      app.getFileIcon(firstNorm, { size: "small" }).catch(() => {});
 
+      markShellDragActive();
+      scheduleShellDragInactive(30000);
       _lastNativeDragStartAt = Date.now();
       _lastDesktopDetectAt = 0;
-      try { console.log('[timing] native-drag-start placeholder=', lastDragPlaceholderBaseName); } catch {}
 
-      // IMPORTANT:
-      // Ne pas finaliser via un timer côté main pendant le drop Windows.
-      // Cela crée une race au relâchement (double finalisation) qui peut faire crasher.
-      // La finalisation est faite uniquement côté renderer (dragend -> finalizeDesktopDrop).
       if (_desktopDropPollTimer) {
         clearInterval(_desktopDropPollTimer);
         _desktopDropPollTimer = null;
@@ -2487,6 +3055,7 @@ async function getLnkIcon(lnkPath) {
   });
 
   ipcMain.on('shell-drag-ended', () => {
+    setTimeout(() => broadcastInterFenceDragPhase(false), 150);
     scheduleShellDragInactive(200);
     setTimeout(() => {
       if (!_shellDragActive) {
@@ -2525,7 +3094,10 @@ async function getLnkIcon(lnkPath) {
     const paths = Array.isArray(filePaths) ? filePaths : [];
     if (!paths.length) return false;
     const moved = await movePathsBetweenFences(paths, draggedItem.fenceId, targetFenceId);
-    if (moved) draggedItem = null;
+    if (moved) {
+      draggedItem = null;
+      broadcastInterFenceDragPhase(false);
+    }
     return moved;
   });
 
@@ -2569,9 +3141,30 @@ async function getLnkIcon(lnkPath) {
     const { filePaths, fenceId: sourceFenceId } = draggedItem;
 
     if (sourceFenceId === targetFenceId) {
+      const desktop = app.getPath('desktop');
+      const targetDir = getFenceStorageDir(targetFenceId);
+      let recovered = 0;
+      for (const filePath of filePaths) {
+        try {
+          const srcInFence = path.normalize(filePath);
+          if (fs.existsSync(srcInFence)) continue;
+          const base = path.basename(srcInFence);
+          const onDesktop = path.join(desktop, base);
+          if (!fs.existsSync(onDesktop)) continue;
+          const dest = ensureUniqueDest(path.join(targetDir, base));
+          await fs.promises.rename(onDesktop, dest);
+          recovered++;
+          console.log('[fence-drag-drop] recovered from desktop:', onDesktop, '->', dest);
+        } catch (err) {
+          console.warn('[fence-drag-drop] same-fence recover failed', filePath, err);
+        }
+      }
+      if (recovered > 0) {
+        notifyFenceRefresh(targetFenceId);
+      }
       console.log('[fence-drag-drop] same fence, skipping');
       draggedItem = null;
-      return null;
+      return recovered > 0 ? { recovered } : null;
     }
 
     // Annuler le timer d'expiration
@@ -2589,7 +3182,7 @@ async function getLnkIcon(lnkPath) {
 
     const results = [];
     try {
-      const targetDir = path.join(FENCES_BASE_DIR, targetFenceId);
+      const targetDir = getFenceStorageDir(targetFenceId);
       fs.mkdirSync(targetDir, { recursive: true });
 
       for (const filePath of filePaths) {
@@ -2628,11 +3221,13 @@ async function getLnkIcon(lnkPath) {
       );
 
       draggedItem = null;
+      broadcastInterFenceDragPhase(false);
       console.log('[fence-drag-drop] success —', results.length, 'file(s) moved');
       return results.length > 0 ? results : null;
     } catch (e) {
       console.error('[fence-drag-drop] fatal:', e);
       draggedItem = null;
+      broadcastInterFenceDragPhase(false);
       return null;
     }
   });
@@ -2680,6 +3275,8 @@ async function getLnkIcon(lnkPath) {
         }
       }
 
+      await showPathOnDesktopExplorer(dest);
+
       try {
         const t1 = Date.now();
         const since = _lastNativeDragStartAt ? (t1 - _lastNativeDragStartAt) : -1;
@@ -2707,6 +3304,16 @@ async function getLnkIcon(lnkPath) {
     return !!enable;
   });
 
+  ipcMain.handle("get-hide-windows-desktop-icons", () => shouldHideWindowsDesktopIcons());
+
+  ipcMain.handle("set-hide-windows-desktop-icons", (_evt, enable) => {
+    const cfg = readConfig();
+    cfg.hideWindowsDesktopIcons = !!enable;
+    writeConfig(cfg);
+    applyWindowsDesktopIconsVisibility();
+    return !!enable;
+  });
+
   /**
    * Après un copy-to-fence depuis le bureau, déplace l'original du bureau
    * dans un sous-dossier portant le nom de la box.
@@ -2716,67 +3323,47 @@ async function getLnkIcon(lnkPath) {
    */
   ipcMain.handle("move-original-to-box-folder", async (_evt, { srcFullPath, fenceId }) => {
     try {
-      const cfg = readConfig();
-
-      // Vérifier que l'option est activée
-      if (!(cfg.autoOrganizeDesktop ?? true)) {
-        return { ok: false, reason: "disabled" };
-      }
-
-      // Vérifier que le fichier source est bien sur le bureau (pas dans un sous-dossier).
-      // Sur Windows, le bureau peut être redirigé (OneDrive). `app.getPath("desktop")`
-      // n'est pas toujours le même chemin que celui utilisé par l'explorateur.
-      const desktop = app.getPath("desktop");
-      const desktopCandidates = Array.from(new Set([
-        desktop,
-        path.join(os.homedir(), "Desktop"),
-        path.join(os.homedir(), "OneDrive", "Desktop"),
-      ].filter(Boolean).map(p => path.normalize(p))));
-      const srcNorm = path.normalize(srcFullPath);
-      const srcDir = path.dirname(srcNorm);
-
-      const onDesktopRoot = desktopCandidates.some(d => srcDir.toLowerCase() === d.toLowerCase());
-      if (!onDesktopRoot) {
-        try {
-          console.log("[move-original-to-box-folder] not-on-desktop", { srcDir, desktopCandidates, fenceId });
-        } catch {}
-        return { ok: false, reason: "not-on-desktop" };
-      }
-
-      // Vérifier que le fichier existe encore
-      if (!fs.existsSync(srcNorm)) {
-        return { ok: false, reason: "source-missing" };
-      }
-
-      // Récupérer le nom de la fence
-      const fence = cfg.fences.find(f => f.id === fenceId);
-      // Si la fence n'est pas encore dans la config (race lors de la création),
-      // fallback: créer quand même le dossier avec un nom stable.
-      const fenceName = (fence?.name || "").trim() || `Fence-${String(fenceId || "").slice(0, 8)}` || "Fence";
-      // Nettoyer le nom pour éviter les caractères interdits dans un nom de dossier
-      const safeName = fenceName.replace(/[<>:"/\\|?*]/g, "_").trim() || "Fence";
-      const boxFolder = path.join(desktop, safeName);
-
-      // Créer le dossier si nécessaire
-      fs.mkdirSync(boxFolder, { recursive: true });
-
-      // Déplacer le fichier original dans ce dossier
-      const fileName = path.basename(srcNorm);
-      const dest = path.join(boxFolder, fileName);
-
-      // Si le fichier existe déjà dans le dossier de la box, l'écraser (au lieu de créer " (1)")
-      try {
-        if (fs.existsSync(dest)) {
-          await fs.promises.rm(dest, { recursive: true, force: true });
-        }
-      } catch {}
-
-      await fs.promises.rename(srcNorm, dest);
-
-      return { ok: true, destPath: dest, folderPath: boxFolder };
+      return await organizeDesktopOriginal(srcFullPath, fenceId);
     } catch (e) {
       console.error("[move-original-to-box-folder]", e);
       return { ok: false, error: e.message };
+    }
+  });
+
+  ipcMain.handle("move-items-into-folder", async (_evt, { itemPaths, folderPath }) => {
+    try {
+      if (!Array.isArray(itemPaths) || !itemPaths.length) return { ok: false, moved: 0 };
+      if (!folderPath || typeof folderPath !== "string") return { ok: false, moved: 0 };
+
+      const folderNorm = path.normalize(folderPath);
+      if (!isPathInFences(folderNorm)) return { ok: false, moved: 0 };
+      const folderStat = safeStat(folderNorm);
+      if (!folderStat?.isDirectory()) return { ok: false, moved: 0 };
+
+      let moved = 0;
+
+      for (const itemPath of itemPaths) {
+        try {
+          const src = path.normalize(itemPath);
+          if (!isPathInFences(src)) continue;
+          if (src === folderNorm) continue;
+          if (folderNorm.startsWith(src + path.sep)) continue;
+          const dest = ensureUniqueDest(path.join(folderNorm, path.basename(src)));
+          await fs.promises.rename(src, dest);
+          moved++;
+        } catch (e) {
+          console.warn("[move-items-into-folder] skip", itemPath, e);
+        }
+      }
+
+      if (moved > 0) {
+        const fenceId = getFenceIdForPath(folderNorm);
+        if (isValidFenceId(fenceId)) notifyFenceRefresh(fenceId);
+      }
+      return { ok: moved > 0, moved };
+    } catch (e) {
+      console.error("[move-items-into-folder]", e);
+      return { ok: false, moved: 0, error: e.message };
     }
   });
 
@@ -3311,6 +3898,8 @@ async function getLnkIcon(lnkPath) {
 
     createDesktopShortcutIfNeeded();
     ensureBaseDir();
+    restoreWindowsDesktopIcons();
+    applyWindowsDesktopIconsVisibility();
 
     // Lancé au démarrage automatique avec --hidden ?
     const startHidden = process.argv.includes('--hidden');
@@ -3389,6 +3978,7 @@ async function getLnkIcon(lnkPath) {
 
   app.on('before-quit', () => {
     app.isQuitting = true;
+    restoreWindowsDesktopIcons();
     try { globalShortcut.unregisterAll(); } catch {}
   });
 

@@ -1,3 +1,25 @@
+.import-toast {
+  position: fixed;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 90%;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.85);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.35;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s;
+  z-index: 9999;
+}
+
+.import-toast.visible {
+  opacity: 1;
+}
+
 :root {
   --bg: rgba(30, 30, 30, 0.6);
   --bg-hover: rgba(40, 40, 40, 0.7);
@@ -5,6 +27,7 @@
   --text: #f0f0f0;
   --accent: #66aaff;
   --icon-size: 48px;
+  --icon-col-width: calc(var(--icon-size) + 16px);
 }
 
 /* Global */
@@ -84,7 +107,7 @@ body {
   -webkit-app-region: no-drag;
   z-index: 1;
   display: grid;
-  grid-template-columns: repeat(auto-fill, calc(var(--icon-size) + 16px));
+  grid-template-columns: repeat(auto-fill, var(--icon-col-width));
   gap: 12px;
   padding: 12px;
   padding-bottom: 16px;
@@ -136,7 +159,7 @@ body {
 /* Icônes internes */
 
 .icon {
-  width: calc(var(--icon-size) + 16px);
+  width: var(--icon-col-width);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -155,7 +178,7 @@ body {
   font-size: 11px;
   line-height: 1.25;
   text-align: center;
-  max-width: 100%;
+  max-width: var(--icon-col-width);
   color: #e6e6e6;
 
   /* Limite à 2 lignes — les noms trop longs affichent "…" */
@@ -170,6 +193,14 @@ body {
 body.show-extensions .icon .name {
   -webkit-line-clamp: unset;
   overflow: visible;
+}
+
+.icon.is-folder.drop-into-folder,
+.icon.drop-into-folder {
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+  background: rgba(102, 170, 255, 0.12);
 }
 
 /* ─────────────────────────────────────────────── */
